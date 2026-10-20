@@ -71,9 +71,17 @@ probe() {
 
 quiet() { "$@" >/dev/null 2>&1 || true; }
 
-delete_stack() {
-  quiet aws cloudformation delete-stack --stack-name "$STACK" --region "$1"
-  quiet aws cloudformation wait stack-delete-complete --stack-name "$STACK" --region "$1"
+# Deletes the throwaway probe stack. SAFETY: this script must NEVER touch the real application
+# stack ($STACK). An earlier version probed with the real stack's name and deleted the live
+# deployment, so the probe stack has its own name and this function refuses to delete anything
+# that is not exactly "<stack>-probe".
+delete_probe_stack() {
+  if [ "$PROBE" = "$STACK" ] || [[ "$PROBE" != *-probe ]]; then
+    echo "REFUSING to delete stack '$PROBE': it is not a probe stack" >&2
+    return 1
+  fi
+  quiet aws cloudformation delete-stack --stack-name "$PROBE" --region "$1"
+  quiet aws cloudformation wait stack-delete-complete --stack-name "$PROBE" --region "$1"
 }
 
 # Probes everything that is regional. Needs the probe role (global) to exist already.
@@ -83,12 +91,12 @@ probe_region() {
   echo "== $region =="
 
   probe "$region" "cloudformation: CreateChangeSet (sam deploy)" \
-    aws cloudformation create-change-set --stack-name "$STACK" --change-set-name probe \
+    aws cloudformation create-change-set --stack-name "$PROBE" --change-set-name probe \
     --change-set-type CREATE --template-body "$TEMPLATE" --region "$region"
-  delete_stack "$region"
+  delete_probe_stack "$region"
   probe "$region" "cloudformation: CreateStack" \
-    aws cloudformation create-stack --stack-name "$STACK" --template-body "$TEMPLATE" --region "$region"
-  delete_stack "$region"
+    aws cloudformation create-stack --stack-name "$PROBE" --template-body "$TEMPLATE" --region "$region"
+  delete_probe_stack "$region"
 
   probe "$region" "s3: CreateBucket" \
     aws s3api create-bucket --bucket "$bucket" --region "$region" \

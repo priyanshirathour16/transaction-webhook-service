@@ -93,6 +93,8 @@ Resources:
               - cloudformation:TagResource
             Resource:
               - !Sub 'arn:${AWS::Partition}:cloudformation:${DeployRegion}:${AWS::AccountId}:stack/${StackName}/*'
+              # The throwaway stack used by the "Diagnose AWS access" workflow.
+              - !Sub 'arn:${AWS::Partition}:cloudformation:${DeployRegion}:${AWS::AccountId}:stack/${StackName}-probe/*'
               # SAM CLI keeps its artifact bucket in this helper stack.
               - !Sub 'arn:${AWS::Partition}:cloudformation:${DeployRegion}:${AWS::AccountId}:stack/aws-sam-cli-managed-default/*'
 
