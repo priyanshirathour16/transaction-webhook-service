@@ -49,6 +49,9 @@ exit 0`,
         PATH: `${workdir}${delimiter}${process.env.PATH}`,
         AWS_REGIONS: 'ap-southeast-2',
         STACK_NAME: REAL_STACK,
+        // On GitHub Actions this points at the real job summary; the script would write this test's
+        // FAKE results into it and make them look like a real diagnosis.
+        GITHUB_STEP_SUMMARY: '',
         ...env,
       },
     });
@@ -58,7 +61,9 @@ afterAll(() => {
   if (workdir) rmSync(workdir, { recursive: true, force: true });
 });
 
-describe.skipIf(!hasBash)('scripts/diagnose-aws-access.sh', () => {
+// Each test runs the whole script, which starts a few dozen shell processes: seconds, not
+// milliseconds, so the default 5 s limit is too tight on a busy machine.
+describe.skipIf(!hasBash)('scripts/diagnose-aws-access.sh', { timeout: 60_000 }, () => {
   const calls = () => readFileSync(callLog, 'utf8').split('\n').filter(Boolean);
   const stackCalls = () => calls().filter((line) => line.startsWith('cloudformation '));
   // "--stack-name transaction-webhook-service" followed by a space or the end: the REAL stack,
