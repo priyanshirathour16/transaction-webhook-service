@@ -14,7 +14,7 @@ import { parseDatabaseConfig } from '#src/config/env.js';
 import { checkDatabase } from './lib/database-check.js';
 import { formatMs } from './lib/stats.js';
 
-const EXPECTED_REGION = process.env.EXPECTED_DB_REGION ?? 'ap-south-1';
+const EXPECTED_REGION = process.env.EXPECTED_DB_REGION ?? 'ap-southeast-2';
 
 if (existsSync('.env')) process.loadEnvFile('.env');
 

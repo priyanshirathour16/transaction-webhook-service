@@ -19,7 +19,7 @@ Parameters:
     Description: Name of the application stack the pipeline deploys. Must match STACK_NAME in deploy.yml.
   DeployRegion:
     Type: String
-    Default: ap-south-1
+    Default: ap-southeast-2
     AllowedPattern: '^[a-z]{2}(-[a-z]+)+-[0-9]$'
     Description: >
       Region the pipeline deploys the application to. Must match AWS_REGION in deploy.yml. The permissions are

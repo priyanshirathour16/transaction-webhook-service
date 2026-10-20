@@ -35,7 +35,7 @@ A service that receives payment-processor transaction webhooks (RazorPay-style),
 | IaC / deploy | **AWS SAM** | Simplest for Lambda + SQS + EventBridge |
 | Signature check | **Optional HMAC-SHA256**, enforced only when `WEBHOOK_SECRET` is set | Realistic for payment webhooks; does not break evaluator's plain POSTs |
 | Extras | **GitHub Actions CI/CD, unit + integration tests, observability** | Per your selection |
-| Region | **ap-south-1 (Mumbai)** for AWS **and** Supabase | INR use case; same region keeps DB latency low (critical for the 500 ms budget) |
+| Region | **ap-southeast-2 (Sydney)** for AWS **and** Supabase | *Originally ap-south-1 (Mumbai) for the INR use case. Changed after a multi-region probe (`scripts/diagnose-aws-access.sh`) showed the account's AWS Organization blocks regional services in Mumbai, Singapore, Seoul, Ireland and Oregon. Sydney is the closest allowed region to India.* The database must stay in the same region as the Lambdas (critical for the 500 ms budget) |
 
 ### Alternatives considered (and why not)
 - **BullMQ + Redis**: needs an always-on worker; doesn't fit Lambda and Redis is not free on AWS.
@@ -272,7 +272,7 @@ Design principle: **ports & adapters** — business logic depends on the reposit
 
 ## 16. Execution phases (checklist)
 
-- [ ] **Phase 0 – Accounts**: follow [AWS_SETUP.md](AWS_SETUP.md) — AWS account (note creation date), Supabase project in ap-south-1, GitHub public repo, AWS OIDC role, alert email.
+- [ ] **Phase 0 – Accounts**: follow [AWS_SETUP.md](AWS_SETUP.md) — AWS account (note creation date), Supabase project in ap-southeast-2, GitHub public repo, AWS OIDC role, alert email.
 - [x] **Phase 1 – Foundation**: JS project (ESM), lint/format, config, logger, DB module, migration #1. *(done: lint clean, 8 tests passing; migrations verified on local Postgres; converted from TypeScript to JavaScript)*
 - [x] **Phase 2 – Domain**: repository, queue port + adapters, transaction service (idempotency logic). *(done: 47 tests passing; concurrency tests mutation-checked. Added `REPAIR_GRACE_SECONDS` so a duplicate racing the original request does not double-enqueue; processing uses a row lock `SELECT … FOR UPDATE` instead of a bare conditional UPDATE so the external call runs at most once per commit)*
 - [x] **Phase 3 – API**: Express app (migrated from Fastify after Phase 5; same behaviour, 138 tests passing), three endpoints, validation, optional HMAC, error handling. *(originally done with 113 tests; verified with curl against a running local server. Added: Lambda handler `src/handlers/api.js` with warm-up ping, local dev server `npm run dev`. Decisions: 202 body is always `{status:"ACCEPTED", duplicate:bool}`; no type coercion; currency normalised to upper case; unknown id → 404 `{error:{code:"TRANSACTION_NOT_FOUND"}}`; non-JSON content type → 415)*
@@ -285,6 +285,7 @@ Design principle: **ports & adapters** — business logic depends on the reposit
 - [x] **Restructure to modern conventions** (requested after Phase 5): kebab-case role-suffixed file names, feature modules with routes → controller → service → repository, `src/constants`, `src/middlewares`, `src/infrastructure`, `#src/` subpath imports, `tests/` mirroring `src/`, ESLint rules enforcing the naming (see §11). Behaviour unchanged: 138 tests pass.
 - [x] **Phase 6 – Tests**: unit + integration + concurrency-duplicate test. *(done: 198 tests (incl. `npm run db:check` pre-flight tool and migration 0002 enabling row-level security so Supabase's public REST API cannot expose the tables); coverage 100% lines / 98.8% statements / 96.6% branches with enforced thresholds; `scripts/smoke-test.js` covers the 4 success criteria and `scripts/load-test.js` reports latency percentiles, both tested against a real server including a deliberately failing run; `npm audit` clean. Tests found and fixed a real bug: corrupt compressed bodies returned 500 instead of 400.)*
 - [x] **Phase 7 – CI/CD**: workflows, OIDC, smoke test. *(done, validated offline: `actionlint` clean on `ci.yml` + `deploy.yml`, `cfn-lint` clean on `infra/github-deploy-access.yaml`. The workflows have NOT run yet — they need the repo on GitHub. Permissions are hand-written; expect to add an action or two if the first deploy reports AccessDenied.)*
+  - **Region finding:** every regional service was blocked by an organization policy (SCP) in ap-south-1, and S3 in four other regions; Sydney and N. Virginia were not blocked. Note the probe's "our IAM" cells were inconclusive because our deploy permissions were scoped to Mumbai; a re-probe scoped to Sydney is needed for a definitive answer before deploying.
   - **Learned during Phase 8 setup:** the AWS account sits in an organization whose SCPs explicitly deny CloudShell and `iam:CreateOpenIDConnectProvider`. The keyless OIDC design was therefore replaced by an IAM-user mode (same template, `AccessMode=user`), and the stack is created from the CloudFormation console instead of CloudShell. Other SCP denials may still surface.
 - [ ] **Phase 8 – Deploy & verify**: _the only remaining phase._ Create the deploy-access stack, set the GitHub secrets, push to GitHub, run the pipeline, then run the smoke test + load test against the live URL and record the real numbers (especially cold-start latency) in README.md.
 - [x] **Phase 9 – Docs**: README (run locally, test, endpoints with curl examples, tech choices, trade-offs, teardown) + AWS_SETUP.md. *(done; the live URL and deployed measurements are marked as pending in the README and must be filled in during Phase 8.)*
@@ -305,7 +306,7 @@ Design principle: **ports & adapters** — business logic depends on the reposit
 ### 18.2 Pre-interview checklist (mapped to this project)
 - [ ] **New AWS account on an email never used for AWS**, Free plan, created after July 2025 (older accounts may get no credits). Confirm ~$100 credits on the billing page; do the Explore-AWS tasks for up to +$100.
 - [ ] Root MFA on; **budget alert** set; **IAM user** for daily work (CI uses an OIDC role, never root keys).
-- [ ] **Supabase project created 1–2 days early**, region ap-south-1, DB password saved; open it the morning of the interview (free projects pause after a week idle; our reconciler also keeps it alive once deployed).
+- [ ] **Supabase project created 1–2 days early**, region ap-southeast-2, DB password saved; open it the morning of the interview (free projects pause after a week idle; our reconciler also keeps it alive once deployed).
 - [ ] Tooling installed: Node 22, Git, VS Code, AWS CLI, **SAM CLI**, Docker (local Postgres), one AI tool logged in.
 - [ ] Supabase MCP (optional): connect **only to the test project**, read-only/project-scoped, **review every SQL before approving**; give up after 10 min and use the dashboard.
 - [ ] Laptop, charger, webcam, mic, headphones, stable internet.

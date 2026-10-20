@@ -21,7 +21,9 @@ Goal: end up with a safe AWS account, a Supabase database, and a short list of v
 
 1. **Root MFA**: top-right account menu → *Security credentials* → *Assign MFA device* (authenticator app).
 2. **Budget alert**: Billing → *Budgets* → create a monthly cost budget of **$1–5** with an email alert (also counts as an onboarding task).
-3. **Set the region** to **Asia Pacific (Mumbai) `ap-south-1`** (top-right selector). Everything we deploy lives here.
+3. **Region: Asia Pacific (Sydney) `ap-southeast-2`.** Everything we deploy lives here. (Mumbai would have been the natural
+   choice, but this account's AWS Organization blocks regional services outside an allowed list; Mumbai, Singapore, Seoul,
+   Ireland and Oregon were tested and are not usable. Sydney is the closest allowed region to India.)
 4. **Create an IAM user for daily work** (never use root again):
    - IAM → Users → *Create user* → name `dev-admin` → allow console access.
    - Attach policy **AdministratorAccess** (acceptable for a throwaway assessment account; mention in the README that production would use least privilege).
@@ -41,13 +43,13 @@ Goal: end up with a safe AWS account, a Supabase database, and a short list of v
 | **Docker Desktop** | local Postgres for tests | `docker --version` |
 | **esbuild** (global) | SAM bundles the Lambdas with it and looks for it on your PATH | `npm install -g esbuild` then `esbuild --version` |
 
-Then run `aws configure` and enter: the IAM user's access key ID, secret, region `ap-south-1`, output `json`.
+Then run `aws configure` and enter: the IAM user's access key ID, secret, region `ap-southeast-2`, output `json`.
 Verify with `aws sts get-caller-identity` → it should print your Account ID and the `dev-admin` user.
 
 ## Part 4 — Supabase (database)
 
 1. supabase.com → sign in with GitHub → *New project*.
-2. Name: `walnut-transactions`; **Region: South Asia (Mumbai)**; choose a strong DB password and **save it**.
+2. Name: `walnut-transactions`; **Region: Oceania (Sydney)** (it must match the AWS region, `ap-southeast-2`); choose a strong DB password and **save it**.
 3. Wait until the project is ready. Do this **1–2 days before the interview** and keep it active (free projects pause after ~1 week idle).
 4. Open **Project → Connect** and copy two connection strings (password filled in):
    - **Transaction pooler** (port **6543**) — used by the Lambdas. This is `DATABASE_URL`.
@@ -66,7 +68,8 @@ Verify with `aws sts get-caller-identity` → it should print your Account ID an
      `infra/github-deploy-access.yaml`.
    - Stack name: `transaction-webhook-service-github-access`.
    - Region: any region works for creating this stack (the console may open in a different one than you expect). The
-     permissions it grants always target `DeployRegion`, which defaults to `ap-south-1` (Mumbai).
+     permissions it grants always target `DeployRegion`, which defaults to `ap-southeast-2` (Sydney). If you change the region, update this setting too (CloudFormation → the stack →
+     Update → Use existing template → change `DeployRegion`).
    - **AccessMode:** pick the mode your account allows:
      - **`oidc`** (preferred, no stored keys): also fill in `GitHubOwner` and `GitHubRepository`
        (**case-sensitive**). If this fails with *"not authorized to perform: iam:CreateOpenIDConnectProvider … explicit deny
@@ -103,7 +106,7 @@ Verify with `aws sts get-caller-identity` → it should print your Account ID an
 
 Safe to share in chat:
 - [ ] AWS **Account ID** (12 digits) and confirmation that `aws sts get-caller-identity` works
-- [ ] Region confirmation: `ap-south-1`
+- [ ] Region confirmation: `ap-southeast-2`
 - [ ] AWS account **creation date** and whether ~$100 credits show on the billing page
 - [ ] GitHub **repo URL** (public) and your GitHub username
 - [ ] The **email** to receive alarm notifications

@@ -93,13 +93,13 @@ jobs:
 
       # validate/build never call AWS; the CLI only requires credentials to exist.
       - name: sam validate --lint
-        run: sam validate --lint --region ap-south-1
+        run: sam validate --lint --region ap-southeast-2
         env:
           AWS_ACCESS_KEY_ID: not-used
           AWS_SECRET_ACCESS_KEY: not-used
 
       - name: sam build
-        run: sam build --region ap-south-1
+        run: sam build --region ap-southeast-2
         env:
           AWS_ACCESS_KEY_ID: not-used
           AWS_SECRET_ACCESS_KEY: not-used
