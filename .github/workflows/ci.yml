@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+  # Runs on every push to main by being called from deploy.yml, so a deploy can never skip the
+  # checks (and they do not run twice).
+  workflow_call:
+
+permissions:
+  contents: read
+
+# A newer push to a pull request supersedes the older run. Runs called from the deploy workflow
+# are never cancelled (there github.event_name is "push").
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Lint, format and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Real Postgres for the integration tests (same major version as the docker-compose file).
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: transactions_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d transactions_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/transactions_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Tests with coverage (fails below the thresholds in vitest.config.js)
+        run: npm run test:coverage
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          retention-days: 14
+
+  template:
+    name: Validate and build the SAM template
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      # SAM bundles the Lambda functions with esbuild and looks for it on the PATH.
+      - run: npm install --global esbuild
+
+      # validate/build never call AWS; the CLI only requires credentials to exist.
+      - name: sam validate --lint
+        run: sam validate --lint --region ap-south-1
+        env:
+          AWS_ACCESS_KEY_ID: not-used
+          AWS_SECRET_ACCESS_KEY: not-used
+
+      - name: sam build
+        run: sam build --region ap-south-1
+        env:
+          AWS_ACCESS_KEY_ID: not-used
+          AWS_SECRET_ACCESS_KEY: not-used

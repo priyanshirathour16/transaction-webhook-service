@@ -1,0 +1,22 @@
+version = 0.1
+
+# Secrets (DatabaseUrl, WebhookSecret) are never stored here. Pass them at deploy time:
+#   sam deploy --parameter-overrides "DatabaseUrl=... AlertEmail=you@example.com"
+# CI supplies them from GitHub encrypted secrets.
+
+[default.global.parameters]
+stack_name = "transaction-webhook-service"
+region = "ap-south-1"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.validate.parameters]
+lint = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+resolve_s3 = true
+no_fail_on_empty_changeset = true

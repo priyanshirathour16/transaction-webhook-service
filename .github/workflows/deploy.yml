@@ -1,0 +1,124 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_smoke_test:
+        description: Run the post-deploy smoke test (takes about a minute)
+        type: boolean
+        default: true
+
+# One deployment at a time. A running deployment is never cancelled half-way.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    name: Migrate, deploy and smoke-test
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+
+    permissions:
+      id-token: write # lets the job exchange its GitHub OIDC token for AWS credentials
+      contents: read
+
+    env:
+      AWS_REGION: ap-south-1
+      STACK_NAME: transaction-webhook-service
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      # Configure EITHER of these in the `production` environment, never both:
+      #   - AWS_ROLE_ARN                              keyless: GitHub's OIDC token is exchanged for
+      #                                               short-lived credentials (preferred)
+      #   - AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY a least-privilege IAM user, for accounts whose
+      #                                               organization forbids OIDC providers
+      # Unset secrets arrive as empty strings, which the action ignores.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Schema first: the new code is deployed only after the database is ready for it.
+      # Use Supabase's SESSION pooler string for DATABASE_URL_DIRECT: the direct connection is
+      # IPv6-only and GitHub-hosted runners are IPv4.
+      - name: Apply database migrations
+        run: npm run migrate
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL_DIRECT }}
+          DATABASE_URL_DIRECT: ${{ secrets.DATABASE_URL_DIRECT }}
+          DB_SSL: require
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - run: npm install --global esbuild
+
+      - name: Build
+        run: sam build
+
+      - name: Deploy
+        run: |
+          sam deploy \
+            --stack-name "$STACK_NAME" \
+            --region "$AWS_REGION" \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              "DatabaseUrl=$DATABASE_URL" \
+              "AlertEmail=$ALERT_EMAIL" \
+              "WebhookSecret=$WEBHOOK_SECRET"
+        env:
+          # Passed through the environment, never interpolated into the script text.
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+
+      - name: Read the public URL from the stack outputs
+        id: stack
+        run: |
+          url=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" \
+            --output text)
+          if [ -z "$url" ] || [ "$url" = "None" ]; then
+            echo "::error::ApiUrl output not found on stack $STACK_NAME"
+            exit 1
+          fi
+          echo "api_url=$url" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Deployed"
+            echo "- **API URL:** $url"
+            echo "- **Region:** $AWS_REGION"
+            echo "- **Commit:** \`${GITHUB_SHA::7}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Smoke test the live service
+        if: github.event_name == 'push' || inputs.run_smoke_test
+        run: node scripts/smoke-test.js --url "$API_URL" --expected-delay 30
+        env:
+          API_URL: ${{ steps.stack.outputs.api_url }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
