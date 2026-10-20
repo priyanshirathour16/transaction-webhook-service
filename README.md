@@ -1,149 +1,81 @@
 # Transaction Webhook Service
 
-A service that receives transaction webhooks from payment processors (RazorPay-style), **acknowledges
-them immediately with `202 Accepted`**, and **processes every transaction exactly once in the
-background after a 30-second delay**, storing the result in Postgres.
+A Node.js service that receives transaction webhooks (RazorPay style), replies with `202 Accepted` straight away, and
+then processes each transaction in the background 30 seconds later. Results are stored in Postgres.
 
-Built with Node.js (Express 5) on AWS Lambda, SQS and Supabase Postgres.
+**Live API: https://d2c87kyt7tmin7.cloudfront.net**
 
-| | |
-|---|---|
-| **Public API** | **https://d2c87kyt7tmin7.cloudfront.net** (CloudFront in front of the Lambda, which runs in `ap-southeast-2`) |
-| **Health check** | `GET /` |
-| **Webhook** | `POST /v1/webhooks/transactions` → `202` |
-| **Query (for testing)** | `GET /v1/transactions/{transaction_id}` |
-| **Region** | `ap-southeast-2` (Sydney) for AWS and Supabase. The AWS account's organization policy only permits certain regions (Mumbai is blocked); see [Diagnosing AWS restrictions](#diagnosing-aws-restrictions). |
+It runs on AWS (Lambda, SQS and CloudFront, in the Sydney region) with Supabase Postgres as the database.
 
-## Contents
+| Method | Path | What it does |
+|---|---|---|
+| GET | `/` | health check |
+| POST | `/v1/webhooks/transactions` | receive a webhook, answers `202` |
+| GET | `/v1/transactions/{transaction_id}` | look up a transaction and its status |
 
-1. [How it works](#how-it-works)
-2. [API reference](#api-reference)
-3. [Run it locally](#run-it-locally)
-4. [Test it](#test-it) — including the four success criteria
-5. [Technical choices and trade-offs](#technical-choices-and-trade-offs)
-6. [Reliability and idempotency](#reliability-and-idempotency)
-7. [Project structure and conventions](#project-structure-and-conventions)
-8. [Configuration](#configuration)
-9. [Deploy and operate](#deploy-and-operate)
-10. [Known limitations and next steps](#known-limitations-and-next-steps)
-11. [Development notes](#development-notes)
+Try it:
 
----
+```bash
+curl -i -X POST https://d2c87kyt7tmin7.cloudfront.net/v1/webhooks/transactions \
+  -H 'content-type: application/json' \
+  -d '{"transaction_id":"txn_abc123def456","source_account":"acc_user_789","destination_account":"acc_merchant_456","amount":1500,"currency":"INR"}'
+
+curl https://d2c87kyt7tmin7.cloudfront.net/v1/transactions/txn_abc123def456
+```
+
+The status is `PROCESSING` at first and `PROCESSED` about 30 seconds later.
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    PP[Payment processor] -->|POST webhook| CF[CloudFront<br/>edge near the caller]
-    CF -->|kept-open connection| FU[Lambda Function URL]
-    FU --> API[API Lambda<br/>Express]
-    API -->|1. INSERT … ON CONFLICT DO NOTHING| DB[(Supabase Postgres)]
-    API -->|2. SendMessage, DelaySeconds=30| Q[[SQS queue]]
-    Q -->|after 30 s| W[Worker Lambda]
-    W -->|lock row, process, mark PROCESSED| DB
-    Q -.->|after 5 failed attempts| DLQ[[Dead-letter queue]]
-    DLQ -.-> AL[CloudWatch alarm → email]
-    EB[EventBridge every 5 min] --> REC[Reconciler Lambda]
-    REC -->|find stuck rows, re-queue| Q
-    EB --> WARM[Warm-up ping]
-    TESTER[Tester] -->|GET /v1/transactions/id| FU
+    A[Webhook sender] -->|POST| B[API Lambda]
+    B -->|save the row| C[(Postgres)]
+    B -->|message with 30 s delay| D[SQS queue]
+    D -->|after 30 s| E[Worker Lambda]
+    E -->|mark PROCESSED| C
 ```
 
-**The request path does as little as possible**, so it stays well inside the 500 ms budget: validate the
-body, write one row, send one queue message, answer `202`. Nothing slow happens before the answer.
+1. The API checks the JSON body and saves it to Postgres. `transaction_id` is the primary key, so a duplicate webhook
+   hits a conflict and is ignored. It still gets a `202`, because a sender that retries shouldn't be shown an error.
+2. It puts a message on an SQS queue with a 30 second delay and returns `202`. That is all the request does, which is
+   why it stays fast. CloudFront sits in front of the API Lambda.
+3. 30 seconds later SQS hands the message to the worker Lambda. The worker locks the row, does the processing and sets
+   `status` to `PROCESSED` and fills in `processed_at`.
+4. If the worker fails it is retried up to 5 times. After that the message goes to a dead-letter queue and an alarm
+   sends an email. Every 5 minutes a small job looks for transactions stuck in `PROCESSING` (a lost queue message, for
+   example) and queues them again.
 
-```mermaid
-sequenceDiagram
-    participant P as Processor
-    participant A as API Lambda
-    participant D as Postgres
-    participant Q as SQS
-    participant W as Worker Lambda
-    P->>A: POST /v1/webhooks/transactions
-    A->>D: INSERT (transaction_id is the primary key)
-    A->>Q: SendMessage(delay = 30 s)
-    A-->>P: 202 Accepted
-    Note over Q: message is invisible for 30 s
-    Q->>W: deliver
-    W->>D: SELECT … FOR UPDATE, run processor, UPDATE status = PROCESSED
-```
+## API
 
-How each requirement is met:
+### `POST /v1/webhooks/transactions`
 
-| Requirement | How |
-|---|---|
-| Respond `202` within 500 ms regardless of load | The handler only validates, inserts and enqueues. Processing is never inline. Lambda scales out per request. |
-| 30-second background delay | SQS `DelaySeconds=30`. No process sleeps, nothing is lost on restart, and Lambda is not billed while waiting. |
-| Persistent result | Supabase Postgres `transactions` table with `status`, `created_at`, `processed_at`. |
-| Same `transaction_id` processed once | Primary key + `ON CONFLICT DO NOTHING` at intake; a row lock in the worker. Duplicates answer `202`, never an error. |
-| Reliability | Row is stored **before** the acknowledgement; SQS retries; dead-letter queue; scheduled reconciler; alarms. |
-| Scalable | Stateless compute, queue between intake and processing, capped worker concurrency, one reused DB connection per container. |
+Body fields:
 
----
+- `transaction_id`: string, up to 128 characters (letters, digits and `_ . : -`). This is the idempotency key.
+- `source_account` and `destination_account`: strings, up to 128 characters.
+- `amount`: a number above 0 with at most 4 decimal places.
+- `currency`: 3 letters. `inr` is stored as `INR`.
 
-## API reference
+Extra fields are ignored. Types are strict, so `"amount": "1500"` (a string) is rejected.
 
-### `GET /` — health check
+Responses:
 
-```bash
-curl https://<api>/
-```
-```json
-{ "status": "HEALTHY", "current_time": "2024-01-15T10:30:00.000Z" }
-```
-Makes no database call, so it stays instant and cannot fail because a dependency is slow.
+- `202`: accepted, `{"status":"ACCEPTED","duplicate":false}`. If the id was already received, `duplicate` is `true`.
+  A duplicate is not an error.
+- `400`: invalid body or broken JSON. The response lists every problem.
+- `413` / `415`: body over 16 KB / not `application/json`.
+- `500`: the transaction could not be saved or queued. Sending it again is safe.
+- `401`: only when `WEBHOOK_SECRET` is set and the signature is missing or wrong.
 
-### `POST /v1/webhooks/transactions` — receive a webhook
+Signature check (optional): if `WEBHOOK_SECRET` is set, requests need an `X-Webhook-Signature` header with the hex
+HMAC-SHA256 of the body (RazorPay's `X-Razorpay-Signature` works too). It's not set on the live deployment, so plain
+curl requests work.
 
-```bash
-curl -i -X POST https://<api>/v1/webhooks/transactions \
-  -H 'content-type: application/json' \
-  -d '{
-    "transaction_id": "txn_abc123def456",
-    "source_account": "acc_user_789",
-    "destination_account": "acc_merchant_456",
-    "amount": 1500,
-    "currency": "INR"
-  }'
-```
-```
-HTTP/1.1 202 Accepted
-{"status":"ACCEPTED","duplicate":false}
-```
+### `GET /v1/transactions/{transaction_id}`
 
-| Field | Rules |
-|---|---|
-| `transaction_id` | string, 1–128 characters of `A-Z a-z 0-9 _ . : -`. The idempotency key. |
-| `source_account`, `destination_account` | string, 1–128 characters |
-| `amount` | number, greater than 0, at most 4 decimal places (`150.5` and `1500` are both fine) |
-| `currency` | 3 letters (`INR`, `usd` → stored as `USD`) |
+Returns an array with the transaction:
 
-Extra fields are ignored. Types are strict: `"1500"` (a string) is rejected rather than silently converted.
-
-| Status | When |
-|---|---|
-| `202` | Accepted. `duplicate: true` if this `transaction_id` was already received. **A duplicate is not an error.** |
-| `400` | Invalid or malformed body (`VALIDATION_ERROR` lists every problem; `BAD_REQUEST` for broken JSON) |
-| `401` | Only when `WEBHOOK_SECRET` is configured and the signature is missing or wrong |
-| `413` / `415` | Body larger than 16 KB / not `application/json` |
-| `500` | The transaction could **not** be stored or queued. The sender should retry; retrying is safe. |
-
-**Optional signature check.** If `WEBHOOK_SECRET` is set, requests must carry
-`X-Webhook-Signature` (or RazorPay's `X-Razorpay-Signature`): the hex HMAC-SHA256 of the exact request body.
-If it is not set, no signature is required.
-
-```bash
-BODY='{"transaction_id":"txn_1","source_account":"a","destination_account":"b","amount":10,"currency":"INR"}'
-SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" | awk '{print $2}')
-curl -X POST https://<api>/v1/webhooks/transactions -H 'content-type: application/json' \
-  -H "X-Webhook-Signature: $SIG" -d "$BODY"
-```
-
-### `GET /v1/transactions/{transaction_id}` — read status (for testing)
-
-```bash
-curl https://<api>/v1/transactions/txn_abc123def456
-```
 ```json
 [
   {
@@ -158,354 +90,164 @@ curl https://<api>/v1/transactions/txn_abc123def456
   }
 ]
 ```
-The response is an array (as specified). `status` is `PROCESSING` (with `processed_at: null`), `PROCESSED`, or
-`FAILED` (all retries used up; see [operations](#deploy-and-operate)). An unknown id returns `404`.
 
-All errors share one shape: `{ "error": { "code": "…", "message": "…", "details": […] } }`. Internal details are
-never returned; they go to the logs, tied to the response by the `x-request-id` header.
-
----
+`status` is `PROCESSING` (with `processed_at` null), `PROCESSED`, or `FAILED` when all retries were used up. An unknown
+id gives `404`. Errors always look like `{"error": {"code": "...", "message": "..."}}`, and internal details only go to
+the logs.
 
 ## Run it locally
 
-Needs Node.js 22+, Docker (for Postgres) and npm. **No AWS account is needed**: locally the queue is an
-in-memory stand-in that delivers to the same processing code the worker Lambda runs.
+You need Node.js 22 or newer, Docker (for Postgres) and npm. No AWS account is needed: locally the queue is an
+in-memory stand-in that feeds the same processing code the worker Lambda uses.
 
 ```bash
 npm install
-cp .env.example .env          # Windows PowerShell: Copy-Item .env.example .env
-npm run db:up                 # starts Postgres in Docker on port 5433
+cp .env.example .env          # on Windows PowerShell: Copy-Item .env.example .env
+npm run db:up                 # Postgres in Docker, port 5433
 npm run migrate               # creates the transactions table
 npm run dev                   # http://localhost:3000
 ```
 
-Set `PROCESS_DELAY_SECONDS=5` in `.env` for quicker feedback (the default is 30). Then:
+Set `PROCESS_DELAY_SECONDS=5` in `.env` if you don't want to wait 30 seconds. Then:
 
 ```bash
 curl -X POST localhost:3000/v1/webhooks/transactions -H 'content-type: application/json' \
   -d '{"transaction_id":"txn_1","source_account":"a","destination_account":"b","amount":150.5,"currency":"USD"}'
-curl localhost:3000/v1/transactions/txn_1      # PROCESSING … then PROCESSED a few seconds later
+curl localhost:3000/v1/transactions/txn_1      # PROCESSING, then PROCESSED a few seconds later
 ```
 
-> The local queue is **not durable** (a restart loses pending jobs, which the built-in reconciler then
-> re-queues). It exists only for development and tests.
+The local queue isn't durable. If you restart the dev server, pending jobs are lost until the reconciler queues them
+again.
 
----
-
-## Test it
+## Testing
 
 ```bash
-npm run check            # lint + formatting + every test (what CI runs)
-npm run test:unit        # fast tests, no database
-npm run test:integration # real Postgres (npm run db:up first)
-npm run test:coverage    # with a coverage report in ./coverage
+npm run test:unit      # fast, no database needed
+npm run db:up          # the integration tests use a real Postgres
+npm test               # everything, 222 tests
+npm run check          # lint, formatting and all tests (what CI runs)
 ```
 
-**222 tests, ~99% statement and 100% line coverage** (thresholds are enforced). They include:
+The integration tests cover the awkward cases: 50 identical webhooks arriving at once (one row, one queued job), five
+simultaneous deliveries of the same job (processed once), a queue outage, and a worker that keeps failing until the
+transaction ends up `FAILED` in the dead-letter queue.
 
-- **Concurrency:** 50 simultaneous identical webhooks produce exactly one row and one queued job; 5 simultaneous
-  deliveries of one job run the processor once.
-- **Failure:** queue outage (500, nothing lost, repaired by the sender's retry or the reconciler), transient
-  failures retried, a permanent failure ending as `FAILED` and dead-lettered, then completed after a redrive.
-- **Wiring:** the real Lambda entry points, configured from environment variables, against Postgres.
-- **The tools themselves:** the smoke and load scripts run against a real server, including a run that **must fail**
-  against a broken one, so a green result means something.
+### Testing the deployed API
 
-### Verify the four success criteria against a running service
-
-One command checks all of them and exits non-zero on any failure (about a minute, because of the real 30 s delay):
+One command runs the whole check against the live service. It takes about a minute because it waits for the real 30
+seconds:
 
 ```bash
-npm run smoke -- --url https://<api>                 # add --secret <s> if signatures are enforced
+npm run smoke -- --url https://d2c87kyt7tmin7.cloudfront.net
 ```
 
-| # | Criterion | What the smoke test does |
-|---|---|---|
-| 1 | **Single transaction** | Sends one webhook, expects `202`, then `PROCESSING`, then `PROCESSED` about 30 s later; checks `processed_at − created_at ≈ 30 s`. |
-| 2 | **Duplicate prevention** | Sends the same webhook 10× at once: all `202`, exactly one `duplicate:false`; replays after processing and checks the record is unchanged. |
-| 3 | **Performance** | 35 more webhooks while earlier work is still pending: all `202`, and the **server-side p95 < 500 ms** (the application's own time, from the `Server-Timing` header). End-to-end time is printed too; it also contains the network distance from wherever the test runs, so it only fails the run with `--strict-e2e`. |
-| 4 | **Reliability** | Invalid body → `400`, broken JSON → `400`, wrong content type → `415`, unknown id → `404`, unsigned → `401` (if a secret is set). |
+It checks:
 
-The same by hand:
+1. One webhook gives `202`, then `PROCESSING`, then `PROCESSED` about 30 seconds later.
+2. The same webhook sent 10 times at once gives `202` every time but only one `duplicate: false`, and the stored record
+   doesn't change.
+3. 35 more webhooks while earlier ones are still pending all get `202`, with a server-side p95 under 500 ms.
+4. Bad input is handled: an invalid body and broken JSON give `400`, the wrong content type gives `415`, an unknown id
+   gives `404`.
+
+By hand, in Git Bash (in PowerShell use `curl.exe` instead of `curl`):
 
 ```bash
-API=https://<api>
-curl -X POST $API/v1/webhooks/transactions -H 'content-type: application/json' -d '{…}'   # → 202
-curl $API/v1/transactions/<id>                                                              # → PROCESSING
-sleep 35; curl $API/v1/transactions/<id>                                                    # → PROCESSED
-for i in 1 2 3; do curl -s -X POST $API/v1/webhooks/transactions … ; done                   # same id → 202 each
+API=https://d2c87kyt7tmin7.cloudfront.net
+ID=txn_test_$(date +%s)
+BODY="{\"transaction_id\":\"$ID\",\"source_account\":\"a\",\"destination_account\":\"b\",\"amount\":10,\"currency\":\"INR\"}"
+
+curl -i -X POST $API/v1/webhooks/transactions -H 'content-type: application/json' -d "$BODY"   # 202, duplicate false
+curl -i -X POST $API/v1/webhooks/transactions -H 'content-type: application/json' -d "$BODY"   # 202, duplicate true
+curl $API/v1/transactions/$ID                                                                   # PROCESSING
+sleep 35; curl $API/v1/transactions/$ID                                                         # PROCESSED
 ```
 
-Load test (every request creates a real transaction; keep `--connections` modest on a new AWS account, which may
-allow only ~10 concurrent Lambda executions in total):
+There is also `npm run load-test -- --url <api> --connections 5 --requests 300`. Every request creates a real
+transaction, so keep the numbers small on a new AWS account.
 
-```bash
-npm run load-test -- --url https://<api> --connections 5 --requests 300
-```
+## Technical choices
 
-**Measured results**
+- **Node.js 22 and Express 5, in plain JavaScript.** Express is simple and widely known, and its overhead is tiny next
+  to the database and network time that decide whether a request fits in 500 ms. Plain JavaScript means no build step.
+  Safety comes from runtime validation (Ajv for requests, zod for configuration), database constraints and tests.
+- **A queue instead of processing inside the request.** The webhook handler only validates, saves and enqueues, so the
+  `202` doesn't depend on how slow the processing is.
+- **SQS `DelaySeconds=30` for the 30 second wait.** The delay lives in the queue, so nothing sleeps and nothing is lost
+  if a server restarts. A `setTimeout` would drop jobs on every restart.
+- **Postgres decides what counts as a duplicate.** The primary key plus `INSERT ... ON CONFLICT DO NOTHING` is correct
+  across any number of Lambda instances, which an in-memory check isn't. SQS can deliver a message twice, so the worker
+  also locks the row (`SELECT ... FOR UPDATE`) and the second delivery does nothing.
+- **Save first, queue second.** A webhook is never acknowledged unless it's stored. If the process dies between the two
+  steps, the sender's retry or the 5 minute reconciler queues it again.
+- **Lambda behind CloudFront.** It scales with traffic and costs almost nothing when idle. CloudFront cuts the connection
+  time for callers far from Sydney (see Performance below).
+- **Supabase Postgres** through its transaction pooler, with one connection per Lambda container, so a burst of
+  requests can't use up the database's connections.
+- **SAM and GitHub Actions.** The infrastructure is in `template.yaml`. A push to `main` runs lint and the tests,
+  applies the migrations, deploys, and then runs the smoke test against the live URL.
+- **Optional HMAC signature check**, since real payment webhooks are signed. It's off unless `WEBHOOK_SECRET` is set,
+  so plain test requests aren't blocked.
+- **Region.** My AWS account is inside an organization whose policy only allows a few regions, and Mumbai isn't one of
+  them. I used Sydney, the nearest allowed, and put Supabase there too. The Diagnose AWS access workflow in this repo
+  is how I found out which regions work.
 
-| Where | Result |
-|---|---|
-| Local dev server, 5 connections, 500 requests | all `202`; p50 31 ms, p95 59 ms, p99 66 ms, max 117 ms; ~140 req/s |
-| **Deployed on AWS, from India** (a laptop about 300 ms from Sydney), smoke test through CloudFront | **19 of 19 checks pass.** 35 requests: end-to-end p50 322 ms, **p95 438 ms**, p99 708 ms; the **server's own time** (Server-Timing) p50 21 ms, p95 137 ms. First request 388 ms. Processing finished **30.1 s** after creation. |
-| Same, load test: 120 requests, 4 reused connections | all `202`. Server's own time p50 20 ms, p95 56 ms. End to end p50 332 ms, p90 and p95 about 870 ms, max 2.3 s (see the tail below). |
-| **A brand-new HTTPS connection for every request**, from India (like running `curl` once per call) | **Through CloudFront: webhook POSTs 0.36 to 0.46 s (8 of 8 under 500 ms); health checks 0.35 to 0.45 s in 4 of 6 runs and 0.89 s in 2 of 6.** Direct to the Lambda URL in Sydney: **0.97 to 0.99 s every time** (the TCP and TLS handshakes alone take 0.65 s before the request is even sent). |
-| Earlier, from a GitHub Actions runner, direct to Lambda (before CloudFront) | server's own p95 137 ms, but end-to-end p95 599 ms; the first request, a cold Lambda plus a new connection, took 809 ms. |
+Things I looked at and left out: BullMQ with Redis (it needs a worker that's always running, which Lambda isn't), an ORM
+(heavier cold starts for a single table), and API Gateway (extra cost, nothing gained here).
 
-**Reading latency numbers: server time vs network time.** A request's total time is network travel plus the server's
-own work. Every response carries a standard `Server-Timing: app;dur=…` header with the application's own time in
-milliseconds (it excludes network travel and a Lambda cold start), so the two can be told apart:
-
-```bash
-# the server's own time for this request
-curl -si https://<api>/ | grep -i server-timing
-
-# the full breakdown as a client sees it (DNS, TCP, TLS handshake, first byte, total)
-curl -s -o /dev/null https://<api>/ \
-  -w 'dns %{time_namelookup}s | tcp %{time_connect}s | tls %{time_appconnect}s | first byte %{time_starttransfer}s | total %{time_total}s\n'
-```
-
-The smoke and load tests print both the end-to-end and the server-side figures. The Lambda runs in Sydney (the only
-region this AWS account's organization allows that is reasonably near India), so a caller far away would pay several
-network round trips before the server even starts: a fresh HTTPS connection needs about three, and one round trip
-from India to Sydney is about 300 ms. That is why the service sits behind **CloudFront**, which ends the HTTPS
-connection at an edge location near the caller (Delhi, in the tests above) and keeps its own connections open to
-Sydney: a fresh connection dropped from about 0.98 s to about 0.4 s. `curl -i` shows which edge served you
-(`X-Amz-Cf-Pop`).
-
-> Local numbers show the application code is fast; they are **not** a prediction of AWS latency. The first request
-> to a cold Lambda also pays for starting the function and opening the database connection, which is the main
-> risk to the 500 ms target. See [Known limitations](#known-limitations-and-next-steps).
-
----
-
-## Technical choices and trade-offs
-
-| Choice | Why | Trade-off |
-|---|---|---|
-| **Queue + worker** instead of processing in the request | The 500 ms acknowledgement holds however slow processing is; load is absorbed by the queue. | A transaction is briefly stored but not yet processed (visible as `PROCESSING`). |
-| **SQS `DelaySeconds`** for the 30 s wait | Durable, free while waiting, survives restarts and deploys. A `setTimeout` would lose jobs on any restart. | Delivery time is "30 s plus a little queue jitter", not to-the-millisecond. |
-| **Postgres primary key as the idempotency arbiter** | Correct across any number of concurrent Lambda instances; an in-memory check cannot be. | Every intake costs one database round trip. |
-| **Row lock (`SELECT … FOR UPDATE`) in the worker** | At-least-once delivery means duplicates *will* happen; the lock makes the external call run once per commit. | A worker holds a connection while processing (fast here; the 30 s wait is in the queue). |
-| **Store first, then enqueue** | A transaction is never acknowledged unless it is durably saved. | A crash between the two leaves a stored-but-unqueued row, which the sender's retry or the reconciler repairs. |
-| **Scheduled reconciler** | Makes "no transaction is lost" true even if a queue message vanishes. Also keeps a free Supabase project awake. | One more function to run and alarm on. |
-| **Serverless (Lambda + Function URL)** | Scales with traffic, costs about nothing idle, and fits the free tier. | Cold starts; the Function URL has no built-in throttling or WAF. |
-| **CloudFront in front of the Function URL** | Callers far from the Lambda's region otherwise pay about three long round trips for every new HTTPS connection; measured from India, CloudFront cut that from about 0.98 s to about 0.4 s. It never caches (managed `CachingDisabled` policy), forwards every header except `Host`, and allows POST. | One more component. The direct Function URL remains reachable (it is a stack output). A request that makes CloudFront open a fresh connection to the origin still takes about 0.9 s, which is the tail described below. |
-| **Supabase Postgres** (transaction pooler) | Real constraints, `numeric` for money, easy to inspect. | Needs the pooler and a small pool per container to avoid exhausting connections. |
-| **Express 5** | Familiar and easy to explain. Framework overhead is negligible next to the database, SQS and cold-start costs that dominate the 500 ms budget. | Validation is added with Ajv rather than built in. |
-| **Plain JavaScript (ESM)** | No build step; safety comes from runtime validation (Ajv, zod config), database constraints and tests. | No compile-time type checking. |
-| **SAM + GitHub Actions** | Simple IaC and a one-push deploy. The pipeline signs in with keyless OIDC where the account allows it, otherwise with a least-privilege IAM user. | AWS-specific. The IAM-user mode stores a long-lived key as a GitHub secret (see below). |
-| **Optional HMAC check** | Realistic for payment webhooks, but does not break plain test requests. | Off unless `WEBHOOK_SECRET` is set. |
-
-**Considered and rejected:** BullMQ + Redis (needs an always-running worker, which Lambda isn't); processing in the
-request path (fails the 500 ms requirement under load); an ORM (heavier cold starts for one table); API Gateway
-(extra cost for no benefit here); FIFO SQS (extra constraints; the database already deduplicates).
-
-**Supabase's public API is locked off.** Supabase exposes tables in the `public` schema through an auto-generated
-REST API. This service never uses it (it connects to Postgres directly), so migration `0002` enables row-level security
-on the table with no policies: the API roles can read and write nothing, while the service's own connection is
-unaffected. A test proves a low-privilege role sees zero rows.
-
-**Money:** amounts are `numeric(20,4)` in the database and exact decimal strings in the code. They become JSON
-numbers only at the API edge.
-
----
-
-## Reliability and idempotency
-
-| What goes wrong | What happens |
-|---|---|
-| The same webhook arrives many times, even at once | One row, one queued job. The others answer `202` with `duplicate: true`. |
-| Same `transaction_id`, different data | The first record wins and is never overwritten; a warning is logged with the differing field names. |
-| The API crashes after saving but before queuing | The processor's retry re-queues it; if it never retries, the reconciler does within minutes. |
-| The queue is down | The API answers `500` (the row is already saved); the retry repairs it. An alarm fires. |
-| SQS delivers a message twice | The row lock makes the second delivery a no-op. |
-| The worker crashes or a call fails mid-processing | The change rolls back; SQS redelivers; up to 5 attempts. |
-| It keeps failing | After the last attempt the row is marked `FAILED` with `last_error`, the message goes to the dead-letter queue and an alarm emails you. |
-| A bug is fixed after a failure | Redrive the dead-letter queue; the `FAILED` transaction completes. |
-| A queue message is lost | The reconciler finds transactions stuck in `PROCESSING` and re-queues them. |
-
----
-
-## Project structure and conventions
+Project layout:
 
 ```
 src/
-  app.js                     createApp(): builds the Express app, never listens
-  container.js               composition root: the only place adapters are chosen
-  config/env.js              validated configuration
-  constants/                 http-status, error-codes, log-events
-  errors/  middlewares/      HTTP errors; one concern per *.middleware.js
-  modules/
-    health/                  routes + controller
-    transactions/            routes → controller → service → repository (+ schema, mapper, processor)
-  infrastructure/            database/ (pool, migrator)   queue/ (SQS + in-memory)   logging/
-  lib/                       framework-free helpers (webhook signature)
-  handlers/                  AWS Lambda entry points: api, worker, reconciler
-scripts/                     command-line tools: migrate, dev-server, db:check, smoke-test, load-test,
-                             diagnose-aws-access (+ lib/ with their shared helpers)
-migrations/                  versioned SQL
-infra/                       one-time AWS setup: the deploy identity for GitHub Actions
-docs/                        deployment-guide.md (set up your own copy), design-and-plan.md (decisions and history)
-tests/                       mirrors src/ (unit + integration)
-.github/workflows/           ci.yml, deploy.yml, diagnose-aws-access.yml (+ dependabot.yml)
-template.yaml                the application's AWS infrastructure (SAM): functions, queues, alarms, CloudFront
+  app.js, container.js       the Express app, and the one place where the queue and database are chosen
+  config/                    validated environment settings
+  modules/transactions/      routes, controller, service, repository, schema, processor
+  infrastructure/            database, queue (SQS and in-memory), logging
+  handlers/                  Lambda entry points: api, worker, reconciler
+scripts/                     migrate, dev server, smoke test, load test, db check
+migrations/                  SQL
+infra/                       one-time setup of the deploy identity for GitHub Actions
+tests/                       mirrors src/ (unit and integration)
+template.yaml                the AWS infrastructure (SAM)
 ```
 
-Conventions, enforced by ESLint/Prettier rather than just habit: `kebab-case` file names with a role suffix
-(`transactions.service.js`), `node:` prefixes for built-ins, `#src/…` subpath imports instead of `../../..`,
-named constants instead of magic numbers and strings, layers that depend only downward (HTTP never knows about SQS
-or Postgres), LF line endings.
+Files are named in kebab-case with a role suffix (`transactions.service.js`), imports use `#src/...` aliases, and
+ESLint and Prettier enforce this in CI.
 
----
+## Deploying
 
-## Configuration
+Pushing to `main` deploys through `.github/workflows/deploy.yml`. Setting up your own copy (AWS, Supabase, GitHub
+secrets) is covered step by step in [docs/deployment-guide.md](docs/deployment-guide.md).
 
-Environment variables, validated at startup (the process refuses to start with a clear message if one is wrong).
+## Performance
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `DATABASE_URL` | _required_ | Postgres connection string. On AWS use Supabase's **transaction pooler** (port 6543). |
-| `DATABASE_URL_DIRECT` | – | Used by migrations. Use Supabase's **session pooler** string (IPv4); the direct connection is IPv6-only. |
-| `DB_SSL` | `require` | `disable` for the local Docker database |
-| `DB_POOL_MAX` | `1` | Connections per container; Lambda concurrency bounds the total |
-| `QUEUE_DRIVER` | `sqs` | `memory` for local runs and tests only |
-| `QUEUE_URL` | – | Required when `QUEUE_DRIVER=sqs` |
-| `PROCESS_DELAY_SECONDS` | `30` | Delay before processing (SQS maximum 900) |
-| `MAX_RECEIVE_COUNT` | `5` | Attempts before the dead-letter queue; must equal the queue's redrive policy |
-| `WEBHOOK_SECRET` | – | Enables the HMAC signature check (min 8 characters) |
-| `REPAIR_GRACE_SECONDS` | `10` | A duplicate younger than this is assumed to be racing the original request |
-| `RECONCILE_AFTER_SECONDS` | `120` | Re-queue stuck transactions older than this (must exceed the delay) |
-| `RECONCILE_RETRYING_AFTER_SECONDS` | `1800` | Same, for transactions already being retried |
-| `RECONCILE_BATCH_SIZE` | `100` | Rows per reconciler run |
-| `LOG_LEVEL` | `info` | `fatal` … `trace`, or `silent` |
+The webhook handler itself typically takes 20 to 60 ms. Every response has a `Server-Timing` header with the application's own
+time. The total time depends on where you call from. From my laptop in India, about 300 ms from Sydney, a request
+through CloudFront takes 0.35 to 0.45 s end to end, but roughly one in ten is slower (around 0.9 s) when CloudFront has
+to open a new connection to Sydney. Calling the Lambda directly was about 1 s every time because of the TLS handshake
+round trips, which is why I added CloudFront. A caller closer to Sydney, or one that reuses connections, sees much
+less. The numbers and how I measured them are in [docs/performance.md](docs/performance.md).
 
----
+## Known limitations
 
-## Deploy and operate
+- The first request after a quiet period can take longer than 500 ms because the Lambda has to start and connect to
+  the database. A warm-up ping every 5 minutes reduces this.
+- The live deployment accepts unsigned webhooks, and `GET /v1/transactions/{id}` has no authentication. Both are on
+  purpose so it can be tested with plain curl. Setting the `WEBHOOK_SECRET` secret and redeploying turns signatures on.
+- The Lambda's own URL is public as well, so callers can skip CloudFront.
+- The connection to the database is encrypted, but the server certificate isn't verified (Supabase's certificate isn't
+  in Node's trust store). The database URL is stored as a Lambda environment variable instead of in Secrets Manager.
+- The GitHub pipeline signs in with a long-lived IAM access key, because my account's organization blocks the keyless
+  OIDC option. The key only has access to this stack's resources and should be deleted when the project is finished.
+- The processing step is a placeholder. The 30 seconds come from the queue, and the real work would go in
+  `transactions.processor.js` (it has to be safe to run twice).
 
-Full account setup (AWS, Supabase, GitHub) is in [docs/deployment-guide.md](docs/deployment-guide.md). In short:
+Next steps I'd take: an outbox instead of the reconciler, per-provider signature schemes, rate limiting with API Gateway
+and a WAF, and tracing.
 
-**One-time** (as an AWS admin): create the stack in `infra/github-deploy-access.yaml`. It makes a least-privilege
-identity that can deploy only this application's resources, in one of two modes:
+## More documentation
 
-| Mode | Use when | GitHub secrets |
-|---|---|---|
-| `oidc` (preferred) | the AWS account allows creating an OIDC provider | `AWS_ROLE_ARN`. No keys are stored anywhere. |
-| `user` | an organization policy forbids OIDC providers (this project's account does) | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` of the created IAM user. This is a **long-lived key**: scoped to this stack's resources, but still a secret to protect. Delete the user and key when you are done. |
-
-Then add these secrets to the GitHub Environment `production`:
-
-| Secret | Value |
-|---|---|
-| `AWS_ROLE_ARN` **or** the two `AWS_*` keys | from the mode above (set one set, never both) |
-| `DATABASE_URL` | Supabase **transaction pooler** string (port 6543) |
-| `DATABASE_URL_DIRECT` | Supabase **session pooler** string (for migrations) |
-| `ALERT_EMAIL` | where alarms are sent (confirm the SNS email after the first deploy) |
-| `WEBHOOK_SECRET` | optional HMAC secret |
-**Every push to `main`** runs `.github/workflows/deploy.yml`: lint, format, tests → apply migrations → `sam build`
-→ `sam deploy` → read the URL from the stack outputs → run the smoke test against the live service.
-
-**Manual deploy**
-
-```bash
-npm install -g esbuild
-sam build
-sam deploy --guided                                   # first time; afterwards: sam deploy
-# parameters: DatabaseUrl=…  AlertEmail=…  [WebhookSecret=…]
-```
-
-**Tear down:** `sam delete --stack-name transaction-webhook-service`, then delete the access-stack (and with it the IAM user and its key) in the CloudFormation console.
-
-### Checking the database connection
-
-`npm run db:check` tests both connection strings the way the app uses them (`DATABASE_URL` and
-`DATABASE_URL_DIRECT`, from the environment or `.env`): whether each connects, how fast it answers, whether a
-multi-statement transaction works through the pooler, whether the schema exists, and whether the database sits in the
-same region as the application (`EXPECTED_DB_REGION`, default `ap-southeast-2`). Passwords are never printed. Run it before
-the first deploy and whenever a connection problem is suspected.
-
-### Diagnosing AWS restrictions
-
-Some AWS accounts sit inside an AWS Organization whose policies (service control policies) forbid certain actions,
-and each one only shows up as a failed deploy. The manual workflow **Actions → Diagnose AWS access** (script:
-`scripts/diagnose-aws-access.sh`) tries every action the deployment needs on throwaway resources, deletes them again,
-and reports each as `ALLOWED`, `BLOCKED BY ORGANIZATION (SCP)` (nothing in the account can undo this), or
-`DENIED BY OUR IAM POLICY` (fixable in `infra/github-deploy-access.yaml`).
-
-### Operating it
-
-Seven alarms email you: dead-letter queue not empty, queue backlog > 5 min, a transaction marked `FAILED`, an
-unhandled API error, API throttling, and worker or reconciler crashes.
-
-```bash
-# What failed, and why?
-SELECT transaction_id, attempts, last_error FROM transactions WHERE status = 'FAILED';
-
-# Redrive dead-lettered messages after fixing the cause
-DLQ_URL=$(aws cloudformation describe-stacks --stack-name transaction-webhook-service \
-  --query "Stacks[0].Outputs[?OutputKey=='DeadLetterQueueUrl'].OutputValue" --output text)
-DLQ_ARN=$(aws sqs get-queue-attributes --queue-url "$DLQ_URL" --attribute-names QueueArn \
-  --query Attributes.QueueArn --output text)
-aws sqs start-message-move-task --source-arn "$DLQ_ARN"
-```
-
-Logs are structured JSON in CloudWatch (`/aws/lambda/transaction-webhook-service-{api,worker,reconciler}`).
-CloudWatch Logs Insights: `fields @timestamp, event, transaction_id, request_id | filter event = "txn.failed"`.
-
----
-
-## Known limitations and next steps
-
-- **Cold start.** The first request to a cold Lambda includes starting the function and opening the database
-  connection, and may exceed 500 ms. Mitigations in place: same region for AWS and Supabase, a small bundle, a
-  warm-up ping every 5 minutes, one reused connection. Provisioned concurrency would remove it but is not free.
-  _Measured: the first request after a deploy took 809 ms end to end (before CloudFront was added), 388 ms in the
-  later smoke test._
-- **Network distance still counts against the 500 ms budget, and a tail remains.** The AWS account's organization
-  permits regional services only in a few regions, and the closest to India is Sydney (about 300 ms away from the test
-  laptop). CloudFront brings the typical request to roughly 0.35 to 0.45 s, but about one request in ten (the load
-  test's p90/p95 were about 870 ms) is one where CloudFront has to open a fresh connection to Sydney first, which
-  costs about 0.9 s. The application's own time is tens of milliseconds throughout (`Server-Timing`). More steady
-  traffic keeps CloudFront's connections to the origin warm, so the tail matters mostly for sparse, bursty traffic.
-  Not tried: CloudFront Origin Shield, which is not free and may not apply to POST requests.
-- **The acknowledgement waits for the database and queue.** That is deliberate (nothing is acknowledged unless it is
-  safe). If cold starts proved too slow, the alternative is to queue first and let the worker write to the database.
-- **Brand-new AWS accounts** may be limited to ~10 concurrent Lambda executions; worker concurrency is capped
-  (default 5) to leave room for the API.
-- **No authentication on the query endpoint** (it is for testing, as specified). Production would protect it.
-- **The deployed endpoint accepts unsigned webhooks.** The HMAC check is built, tested and optional, and `WEBHOOK_SECRET`
-  is deliberately left unset in the live deployment so a tester can send plain requests. To enforce signatures, add the
-  `WEBHOOK_SECRET` secret to the GitHub environment and redeploy; callers then need the `X-Webhook-Signature` header
-  (see the API reference).
-- **The direct Lambda URL is public as well**, so callers can bypass CloudFront (and anything added there later, such as
-  a WAF). The Function URL cannot be locked to CloudFront here: CloudFront's signing for Lambda URLs requires callers to
-  send a payload hash header, which ordinary webhook senders do not.
-- **TLS to the database is encrypted but the server certificate is not verified** (`rejectUnauthorized: false`),
-  because Supabase's pooler certificate is not in Node's default trust store. Verifying it means bundling Supabase's CA
-  certificate and passing it as `ssl.ca`; that is the next hardening step.
-- **The database URL is a Lambda environment variable** (encrypted at rest, but readable by anyone allowed to read the
-  function's configuration). Production would fetch it from Secrets Manager or SSM Parameter Store, at the cost of an
-  extra call on a cold start.
-- **The GitHub pipeline uses a long-lived IAM user key** because this account's organization forbids the keyless OIDC
-  option. It is limited to this stack's resources; delete the access stack when finished (see Tear down).
-- **The processing step is a stub** (the delay comes from the queue). The real external call goes in
-  `transactions.processor.js`; it must be safe to retry.
-- **Free tiers.** The AWS Free plan ends after 6 months or when credits run out (Lambda and SQS usage here is
-  tiny); a free Supabase project pauses after a week of inactivity, which the reconciler prevents.
-- **Next steps:** a transactional outbox/CDC instead of the reconciler, per-provider signature schemes, API Gateway +
-  WAF for rate limiting, distributed tracing, and a dashboard.
-
----
-
-## Development notes
-
-This project was built with AI assistance (Claude Code). The work was reviewed and verified rather than accepted
-as written: behaviour is pinned by tests, key safety properties were checked by deliberately breaking the code
-(for example, removing the row lock makes the concurrent-delivery test fail), and several defects were found and
-fixed this way. Examples: a corrupt compressed request body returned a 500 instead of a 400, a flaky latency test
-did not reflect how Lambda really runs, and the reconciler would have duplicated messages for a transaction that
-was still being retried.
-
-_(Edit this section to describe your own involvement and decisions accurately.)_
+- [docs/deployment-guide.md](docs/deployment-guide.md): setting up AWS, Supabase and GitHub and deploying your own copy
+- [docs/performance.md](docs/performance.md): latency measurements and how to read them
+- [docs/operations.md](docs/operations.md): configuration reference, alarms, redriving failed messages, database check
+- [docs/design-and-plan.md](docs/design-and-plan.md): the original design and the decisions behind it

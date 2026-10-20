@@ -103,7 +103,8 @@ migrations, builds, deploys, reads the public URL from the stack outputs and run
 - A first deployment that fails leaves the stack in `ROLLBACK_COMPLETE`, which CloudFormation cannot update; the workflow
   deletes such a stack automatically before retrying.
 
-Verify the live service yourself with `npm run smoke -- --url <api-url>` (see the README).
+Verify the live service yourself with `npm run smoke -- --url <api-url>` (see "Testing the deployed API" in the
+[README](../README.md#testing-the-deployed-api)).
 
 ## Troubleshooting
 
@@ -114,7 +115,7 @@ Verify the live service yourself with `npm run smoke -- --url <api-url>` (see th
 | A resource fails with `AccessDenied` on an auto-named resource | CloudFormation **shortens** auto-generated names that exceed a service limit (EventBridge rules: 64 characters), so the `<stack>-*` name pattern in the policy stops matching. Give such resources explicit names; a test guards the schedule rules. |
 | The migration step cannot connect | `DATABASE_URL_DIRECT` is the IPv6-only direct string. Use the **session pooler** string. |
 | The Function URL answers `403` | Since late 2025 a public Function URL needs both `lambda:InvokeFunctionUrl` and `lambda:InvokeFunction`; the template states both. |
-| Smoke test: end-to-end latency over 500 ms | It includes network distance from where the test runs. The test gates on the server's own time (`Server-Timing`) and prints both; `--strict-e2e` also holds the end-to-end figure to the budget. See the README's latency section. |
+| Smoke test: end-to-end latency over 500 ms | It includes network distance from where the test runs. The test gates on the server's own time (`Server-Timing`) and prints both; `--strict-e2e` also holds the end-to-end figure to the budget. See [performance.md](performance.md). |
 | `db:check` times out from your laptop | A TLS connection across continents takes many round trips. The tool allows 20 s, but the app itself keeps a strict 3 s because it runs next to the database. |
 
 ## What gets created in AWS
