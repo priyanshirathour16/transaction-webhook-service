@@ -63,6 +63,11 @@ Resources:
   # Split in two because a managed policy is limited to 6,144 characters.
   # NOTE: the identities below are deliberately NOT named "<StackName>-*", so the permissions to
   # manage "<StackName>-*" roles can never be turned against the deploy identity itself.
+  #
+  # NOTE: these permissions match resources by the "<StackName>-" name prefix. CloudFormation
+  # SHORTENS auto-generated names that exceed a service's limit (EventBridge rules: 64 characters),
+  # which silently breaks the prefix. So application resources with long logical ids must be given
+  # explicit names in template.yaml (the two schedule rules are).
   DeployPolicyPlatform:
     Type: AWS::IAM::ManagedPolicy
     Properties:

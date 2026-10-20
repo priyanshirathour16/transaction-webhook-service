@@ -136,6 +136,9 @@ Resources:
         WarmUp:
           Type: Schedule
           Properties:
+            # Explicit name: EventBridge limits rule names to 64 characters, so an auto-generated name
+            # is shortened and then no longer matches the deploy user's "<stack>-*" permission.
+            Name: !Sub '${AWS::StackName}-api-warmup'
             Schedule: rate(5 minutes)
             Description: Keeps a container and its database connection warm for the 500 ms budget.
             Input: '{"warmup": true}'
@@ -223,6 +226,7 @@ Resources:
         Schedule:
           Type: Schedule
           Properties:
+            Name: !Sub '${AWS::StackName}-reconciler-schedule' # explicit, see the note on the warm-up rule
             Schedule: rate(5 minutes)
             Description: Self-healing sweep; also keeps a free Supabase project from pausing.
 
