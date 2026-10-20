@@ -397,6 +397,14 @@ multi-statement transaction works through the pooler, whether the schema exists,
 same region as the application (`EXPECTED_DB_REGION`, default `ap-south-1`). Passwords are never printed. Run it before
 the first deploy and whenever a connection problem is suspected.
 
+### Diagnosing AWS restrictions
+
+Some AWS accounts sit inside an AWS Organization whose policies (service control policies) forbid certain actions,
+and each one only shows up as a failed deploy. The manual workflow **Actions → Diagnose AWS access** (script:
+`scripts/diagnose-aws-access.sh`) tries every action the deployment needs on throwaway resources, deletes them again,
+and reports each as `ALLOWED`, `BLOCKED BY ORGANIZATION (SCP)` (nothing in the account can undo this), or
+`DENIED BY OUR IAM POLICY` (fixable in `infra/github-deploy-access.yaml`).
+
 ### Operating it
 
 Seven alarms email you: dead-letter queue not empty, queue backlog > 5 min, a transaction marked `FAILED`, an
