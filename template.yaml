@@ -161,6 +161,42 @@ Resources:
       Principal: '*'
       InvokedViaFunctionUrl: true
 
+  # ------------------------------------------------------------------- CloudFront
+  # Public front door. A caller far from the function's region would otherwise pay about three
+  # network round trips for every NEW HTTPS connection (TCP, TLS, request). CloudFront ends the
+  # connection at an edge location near the caller and talks to the Function URL over connections it
+  # keeps open, so a fresh-connection request costs a fraction of that.
+  #
+  # It is a pass-through, never a cache: these are API calls (POST webhooks and live status reads).
+  ApiDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${AWS::StackName} public endpoint (ends HTTPS near the caller)'
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_All # include the edge locations nearest to India
+        Origins:
+          - Id: api-function-url
+            # "https://<id>.lambda-url.<region>.on.aws/" -> "<id>.lambda-url.<region>.on.aws"
+            DomainName: !Select [2, !Split ['/', !GetAtt ApiFunctionUrl.FunctionUrl]]
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+              OriginReadTimeout: 30
+              OriginKeepaliveTimeout: 60 # keep the edge-to-origin connection open between requests
+        DefaultCacheBehavior:
+          TargetOriginId: api-function-url
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          # AWS-managed "CachingDisabled": nothing is ever cached.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          # AWS-managed "AllViewerExceptHostHeader": forwards every caller header (content-type,
+          # x-webhook-signature, x-request-id, ...) but NOT Host, which a Function URL requires to be its own.
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+
   WorkerFunction:
     Type: AWS::Serverless::Function
     Metadata:
@@ -395,7 +431,10 @@ Resources:
 
 Outputs:
   ApiUrl:
-    Description: Public base URL. Health check is GET /; webhook is POST /v1/webhooks/transactions.
+    Description: Public base URL (through CloudFront). Health check is GET /; webhook is POST /v1/webhooks/transactions.
+    Value: !Sub 'https://${ApiDistribution.DomainName}/'
+  FunctionUrl:
+    Description: The Lambda Function URL behind CloudFront (same API; slower for callers far from the region).
     Value: !GetAtt ApiFunctionUrl.FunctionUrl
   QueueUrl:
     Value: !Ref TransactionQueue

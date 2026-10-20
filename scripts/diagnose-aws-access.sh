@@ -197,9 +197,19 @@ main() {
   (cd "$WORKDIR" && zip -q probe.zip index.js)
 
   echo
-  echo "== global (IAM) =="
+  echo "== global services =="
   probe "global" "iam: CreateRole (Lambda execution role)" \
     aws iam create-role --role-name "${PROBE}-role" --assume-role-policy-document "$LAMBDA_TRUST"
+  # CloudFront is global. The configuration below is well-formed but names an origin that does not
+  # exist, so if the call is PERMITTED the service rejects it (nothing is created) and the outcome
+  # reads "authorized"; if the organization forbids CloudFront it reads BLOCKED.
+  probe "global" "cloudfront: CreateDistribution (rejected on purpose)" \
+    aws cloudfront create-distribution --region us-east-1 --distribution-config "{
+      \"CallerReference\": \"${PROBE}-$(date +%s)\", \"Comment\": \"probe\", \"Enabled\": false,
+      \"Origins\": {\"Quantity\": 1, \"Items\": [{\"Id\": \"o1\", \"DomainName\": \"example.com\",
+        \"CustomOriginConfig\": {\"HTTPPort\": 80, \"HTTPSPort\": 443, \"OriginProtocolPolicy\": \"https-only\"}}]},
+      \"DefaultCacheBehavior\": {\"TargetOriginId\": \"no-such-origin\", \"ViewerProtocolPolicy\": \"allow-all\",
+        \"ForwardedValues\": {\"QueryString\": false, \"Cookies\": {\"Forward\": \"none\"}}, \"MinTTL\": 0}}"
   sleep 10 # let the new role propagate before Lambda is asked to use it
 
   local region

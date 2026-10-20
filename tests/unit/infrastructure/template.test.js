@@ -53,4 +53,34 @@ describe('template.yaml', () => {
       expect(name.startsWith(`${stackName}-`)).toBe(true);
     }
   });
+
+  describe('CloudFront front door', () => {
+    const text = template.join('\n');
+    const distribution = text.slice(
+      text.indexOf('ApiDistribution:'),
+      text.indexOf('WorkerFunction:'),
+    );
+
+    it('exists, and the public ApiUrl output points at it', () => {
+      expect(distribution).toContain('Type: AWS::CloudFront::Distribution');
+      expect(text).toMatch(
+        /ApiUrl:[\s\S]*?Value: !Sub 'https:\/\/\$\{ApiDistribution\.DomainName\}\/'/,
+      );
+    });
+
+    it('never caches: these are API calls, so a cached POST or stale status would be a bug', () => {
+      // AWS-managed "CachingDisabled" policy
+      expect(distribution).toContain('CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad');
+    });
+
+    it('forwards every caller header except Host, so signatures and content types reach the app', () => {
+      // AWS-managed "AllViewerExceptHostHeader" policy
+      expect(distribution).toContain('OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac');
+    });
+
+    it('allows POST (the webhook) and talks to the function only over HTTPS', () => {
+      expect(distribution).toMatch(/AllowedMethods:\s*\[[^\]]*\bPOST\b[^\]]*\]/);
+      expect(distribution).toContain('OriginProtocolPolicy: https-only');
+    });
+  });
 });
