@@ -82,15 +82,17 @@ jobs:
 
       - name: Deploy
         run: |
+          overrides=("DatabaseUrl=$DATABASE_URL" "AlertEmail=$ALERT_EMAIL")
+          # WEBHOOK_SECRET is optional. SAM rejects an empty "Name=" override, so only pass it when set.
+          if [ -n "$WEBHOOK_SECRET" ]; then
+            overrides+=("WebhookSecret=$WEBHOOK_SECRET")
+          fi
           sam deploy \
             --stack-name "$STACK_NAME" \
             --region "$AWS_REGION" \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
-            --parameter-overrides \
-              "DatabaseUrl=$DATABASE_URL" \
-              "AlertEmail=$ALERT_EMAIL" \
-              "WebhookSecret=$WEBHOOK_SECRET"
+            --parameter-overrides "${overrides[@]}"
         env:
           # Passed through the environment, never interpolated into the script text.
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
