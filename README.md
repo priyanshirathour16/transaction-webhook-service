@@ -8,7 +8,7 @@ Built with Node.js (Express 5) on AWS Lambda, SQS and Supabase Postgres.
 
 | | |
 |---|---|
-| **Public API** | **https://xr4owskbawbjsmihvcdnk7w5i40ilffm.lambda-url.ap-southeast-2.on.aws** |
+| **Public API** | **https://d2c87kyt7tmin7.cloudfront.net** (CloudFront in front of the Lambda, which runs in `ap-southeast-2`) |
 | **Health check** | `GET /` |
 | **Webhook** | `POST /v1/webhooks/transactions` → `202` |
 | **Query (for testing)** | `GET /v1/transactions/{transaction_id}` |
@@ -34,7 +34,8 @@ Built with Node.js (Express 5) on AWS Lambda, SQS and Supabase Postgres.
 
 ```mermaid
 flowchart LR
-    PP[Payment processor] -->|POST webhook| FU[Lambda Function URL]
+    PP[Payment processor] -->|POST webhook| CF[CloudFront<br/>edge near the caller]
+    CF -->|kept-open connection| FU[Lambda Function URL]
     FU --> API[API Lambda<br/>Express]
     API -->|1. INSERT … ON CONFLICT DO NOTHING| DB[(Supabase Postgres)]
     API -->|2. SendMessage, DelaySeconds=30| Q[[SQS queue]]
@@ -247,7 +248,10 @@ npm run load-test -- --url https://<api> --connections 5 --requests 300
 | Where | Result |
 |---|---|
 | Local dev server, 5 connections, 500 requests | all `202`; p50 31 ms, p95 59 ms, p99 66 ms, max 117 ms; ~140 req/s |
-| **Deployed on AWS (Sydney)**, smoke test from a GitHub Actions runner far from Sydney | all `202`. **Server-side** (Server-Timing): p50 **18 ms**, p95 **137 ms**, max 152 ms. **End to end**: p50 186 ms, p95 599 ms (about 170 ms of network round trip per request; a fresh HTTPS connection costs about three). First request after the deploy, **a cold Lambda plus a new connection: 809 ms**. Background processing finished **31.5 s** after creation. |
+| **Deployed on AWS, from India** (a laptop about 300 ms from Sydney), smoke test through CloudFront | **19 of 19 checks pass.** 35 requests: end-to-end p50 322 ms, **p95 438 ms**, p99 708 ms; the **server's own time** (Server-Timing) p50 21 ms, p95 137 ms. First request 388 ms. Processing finished **30.1 s** after creation. |
+| Same, load test: 120 requests, 4 reused connections | all `202`. Server's own time p50 20 ms, p95 56 ms. End to end p50 332 ms, p90 and p95 about 870 ms, max 2.3 s (see the tail below). |
+| **A brand-new HTTPS connection for every request**, from India (like running `curl` once per call) | **Through CloudFront: webhook POSTs 0.36 to 0.46 s (8 of 8 under 500 ms); health checks 0.35 to 0.45 s in 4 of 6 runs and 0.89 s in 2 of 6.** Direct to the Lambda URL in Sydney: **0.97 to 0.99 s every time** (the TCP and TLS handshakes alone take 0.65 s before the request is even sent). |
+| Earlier, from a GitHub Actions runner, direct to Lambda (before CloudFront) | server's own p95 137 ms, but end-to-end p95 599 ms; the first request, a cold Lambda plus a new connection, took 809 ms. |
 
 **Reading latency numbers: server time vs network time.** A request's total time is network travel plus the server's
 own work. Every response carries a standard `Server-Timing: app;dur=…` header with the application's own time in
@@ -262,9 +266,13 @@ curl -s -o /dev/null https://<api>/ \
   -w 'dns %{time_namelookup}s | tcp %{time_connect}s | tls %{time_appconnect}s | first byte %{time_starttransfer}s | total %{time_total}s\n'
 ```
 
-The smoke and load tests print both the end-to-end and the server-side figures. The service runs in Sydney, so a
-caller far away pays several network round trips before the server even starts (a fresh HTTPS connection needs about
-three), and a network round trip of 150 to 400 ms is enough to consume most of a 500 ms budget by itself.
+The smoke and load tests print both the end-to-end and the server-side figures. The Lambda runs in Sydney (the only
+region this AWS account's organization allows that is reasonably near India), so a caller far away would pay several
+network round trips before the server even starts: a fresh HTTPS connection needs about three, and one round trip
+from India to Sydney is about 300 ms. That is why the service sits behind **CloudFront**, which ends the HTTPS
+connection at an edge location near the caller (Delhi, in the tests above) and keeps its own connections open to
+Sydney: a fresh connection dropped from about 0.98 s to about 0.4 s. `curl -i` shows which edge served you
+(`X-Amz-Cf-Pop`).
 
 > Local numbers show the application code is fast; they are **not** a prediction of AWS latency. The first request
 > to a cold Lambda also pays for starting the function and opening the database connection, which is the main
@@ -283,6 +291,7 @@ three), and a network round trip of 150 to 400 ms is enough to consume most of a
 | **Store first, then enqueue** | A transaction is never acknowledged unless it is durably saved. | A crash between the two leaves a stored-but-unqueued row, which the sender's retry or the reconciler repairs. |
 | **Scheduled reconciler** | Makes "no transaction is lost" true even if a queue message vanishes. Also keeps a free Supabase project awake. | One more function to run and alarm on. |
 | **Serverless (Lambda + Function URL)** | Scales with traffic, costs about nothing idle, and fits the free tier. | Cold starts; the Function URL has no built-in throttling or WAF. |
+| **CloudFront in front of the Function URL** | Callers far from the Lambda's region otherwise pay about three long round trips for every new HTTPS connection; measured from India, CloudFront cut that from about 0.98 s to about 0.4 s. It never caches (managed `CachingDisabled` policy), forwards every header except `Host`, and allows POST. | One more component. The direct Function URL remains reachable (it is a stack output). A request that makes CloudFront open a fresh connection to the origin still takes about 0.9 s, which is the tail described below. |
 | **Supabase Postgres** (transaction pooler) | Real constraints, `numeric` for money, easy to inspect. | Needs the pooler and a small pool per container to avoid exhausting connections. |
 | **Express 5** | Familiar and easy to explain. Framework overhead is negligible next to the database, SQS and cold-start costs that dominate the 500 ms budget. | Validation is added with Ajv rather than built in. |
 | **Plain JavaScript (ESM)** | No build step; safety comes from runtime validation (Ajv, zod config), database constraints and tests. | No compile-time type checking. |
@@ -449,13 +458,15 @@ CloudWatch Logs Insights: `fields @timestamp, event, transaction_id, request_id 
 - **Cold start.** The first request to a cold Lambda includes starting the function and opening the database
   connection, and may exceed 500 ms. Mitigations in place: same region for AWS and Supabase, a small bundle, a
   warm-up ping every 5 minutes, one reused connection. Provisioned concurrency would remove it but is not free.
-  _Measured on the deployed service: the first request took 809 ms end to end (see the results table above)._
-- **Network distance counts against the 500 ms budget.** The AWS account's organization permits regional services only in
-  a few regions, and the closest to India is Sydney. A caller far from Sydney pays a network round trip on every
-  request, and a brand-new HTTPS connection costs about three of them, so end-to-end time from far away can exceed
-  500 ms even though the application itself answers in tens of milliseconds (see `Server-Timing`). Putting a CDN in
-  front (for example CloudFront, which terminates the connection near the caller) is the standard remedy and would be
-  the next step, subject to the organization allowing it.
+  _Measured: the first request after a deploy took 809 ms end to end (before CloudFront was added), 388 ms in the
+  later smoke test._
+- **Network distance still counts against the 500 ms budget, and a tail remains.** The AWS account's organization
+  permits regional services only in a few regions, and the closest to India is Sydney (about 300 ms away from the test
+  laptop). CloudFront brings the typical request to roughly 0.35 to 0.45 s, but about one request in ten (the load
+  test's p90/p95 were about 870 ms) is one where CloudFront has to open a fresh connection to Sydney first, which
+  costs about 0.9 s. The application's own time is tens of milliseconds throughout (`Server-Timing`). More steady
+  traffic keeps CloudFront's connections to the origin warm, so the tail matters mostly for sparse, bursty traffic.
+  Not tried: CloudFront Origin Shield, which is not free and may not apply to POST requests.
 - **The acknowledgement waits for the database and queue.** That is deliberate (nothing is acknowledged unless it is
   safe). If cold starts proved too slow, the alternative is to queue first and let the worker write to the database.
 - **Brand-new AWS accounts** may be limited to ~10 concurrent Lambda executions; worker concurrency is capped
