@@ -201,7 +201,7 @@ npm run test:integration # real Postgres (npm run db:up first)
 npm run test:coverage    # with a coverage report in ./coverage
 ```
 
-**215 tests, ~99% statement and 100% line coverage** (thresholds are enforced). They include:
+**222 tests, ~99% statement and 100% line coverage** (thresholds are enforced). They include:
 
 - **Concurrency:** 50 simultaneous identical webhooks produce exactly one row and one queued job; 5 simultaneous
   deliveries of one job run the processor once.
@@ -472,6 +472,21 @@ CloudWatch Logs Insights: `fields @timestamp, event, transaction_id, request_id 
 - **Brand-new AWS accounts** may be limited to ~10 concurrent Lambda executions; worker concurrency is capped
   (default 5) to leave room for the API.
 - **No authentication on the query endpoint** (it is for testing, as specified). Production would protect it.
+- **The deployed endpoint accepts unsigned webhooks.** The HMAC check is built, tested and optional, and `WEBHOOK_SECRET`
+  is deliberately left unset in the live deployment so a tester can send plain requests. To enforce signatures, add the
+  `WEBHOOK_SECRET` secret to the GitHub environment and redeploy; callers then need the `X-Webhook-Signature` header
+  (see the API reference).
+- **The direct Lambda URL is public as well**, so callers can bypass CloudFront (and anything added there later, such as
+  a WAF). The Function URL cannot be locked to CloudFront here: CloudFront's signing for Lambda URLs requires callers to
+  send a payload hash header, which ordinary webhook senders do not.
+- **TLS to the database is encrypted but the server certificate is not verified** (`rejectUnauthorized: false`),
+  because Supabase's pooler certificate is not in Node's default trust store. Verifying it means bundling Supabase's CA
+  certificate and passing it as `ssl.ca`; that is the next hardening step.
+- **The database URL is a Lambda environment variable** (encrypted at rest, but readable by anyone allowed to read the
+  function's configuration). Production would fetch it from Secrets Manager or SSM Parameter Store, at the cost of an
+  extra call on a cold start.
+- **The GitHub pipeline uses a long-lived IAM user key** because this account's organization forbids the keyless OIDC
+  option. It is limited to this stack's resources; delete the access stack when finished (see Tear down).
 - **The processing step is a stub** (the delay comes from the queue). The real external call goes in
   `transactions.processor.js`; it must be safe to retry.
 - **Free tiers.** The AWS Free plan ends after 6 months or when credits run out (Lambda and SQS usage here is

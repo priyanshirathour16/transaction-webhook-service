@@ -7,9 +7,9 @@ import {
 } from '../../../scripts/lib/database-check.js';
 
 const mumbai =
-  'postgresql://postgres.byrmchhznfjeyievslyd:s3cretPassw0rd@aws-0-ap-south-1.pooler.supabase.com:6543/postgres';
+  'postgresql://postgres.exampleprojectrefaaaa:s3cretPassw0rd@aws-0-ap-south-1.pooler.supabase.com:6543/postgres';
 const seoul =
-  'postgresql://postgres.ygubgvsyptytvfflnkih:s3cretPassw0rd@aws-0-ap-northeast-2.pooler.supabase.com:5432/postgres';
+  'postgresql://postgres.exampleprojectrefbbbb:s3cretPassw0rd@aws-0-ap-northeast-2.pooler.supabase.com:5432/postgres';
 
 describe('poolerRegion', () => {
   it('reads the region out of a Supabase pooler host', () => {
