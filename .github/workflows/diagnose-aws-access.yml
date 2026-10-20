@@ -1,11 +1,16 @@
 name: Diagnose AWS access
 
-# Manual troubleshooting tool. Tries each AWS action the deployment needs, on throwaway resources
-# that it deletes again, and reports which are blocked by an AWS Organization (service control
-# policy) and which are missing from our own IAM policy. Run it from the Actions tab.
+# Manual troubleshooting tool. Tries each AWS action the deployment needs, in each listed region, on
+# throwaway resources that it deletes again, and reports which are blocked by an AWS Organization
+# (service control policy) and which are missing from our own IAM policy. Run it from the Actions tab.
 
 on:
   workflow_dispatch:
+    inputs:
+      regions:
+        description: Comma-separated regions to probe
+        type: string
+        default: ap-southeast-2,us-east-1,ap-south-1,ap-southeast-1,ap-northeast-2,eu-west-1,us-west-2
 
 permissions:
   contents: read
@@ -14,12 +19,12 @@ jobs:
   diagnose:
     name: Probe the deploy identity
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     environment: production
 
     env:
-      AWS_REGION: ap-south-1
       STACK_NAME: transaction-webhook-service
+      PROBE_REGIONS: ${{ inputs.regions }}
 
     steps:
       - uses: actions/checkout@v4
@@ -30,7 +35,7 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region: us-east-1
 
       - name: Probe AWS access
-        run: bash scripts/diagnose-aws-access.sh
+        run: AWS_REGIONS="$PROBE_REGIONS" bash scripts/diagnose-aws-access.sh
