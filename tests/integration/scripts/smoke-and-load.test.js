@@ -149,6 +149,10 @@ describe('load-test script', () => {
     expect(result.passed).toBe(true);
     expect(result.statuses).toEqual({ 202: 80 });
     expect(result.summary.count).toBe(80);
+    // Every response carried a Server-Timing header, and the server's own time is part of (so never
+    // more than) what the client measured end to end.
+    expect(result.serverSummary.count).toBe(80);
+    expect(result.serverSummary.p95).toBeLessThanOrEqual(result.summary.p95);
     expect(result.summary.p50).toBeLessThanOrEqual(result.summary.p95);
     expect(result.summary.p95).toBeLessThanOrEqual(result.summary.max);
 

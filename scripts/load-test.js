@@ -40,6 +40,7 @@ export async function runLoadTest({
 }) {
   const client = createWebhookClient({ baseUrl, secret });
   const latencies = [];
+  const serverLatencies = []; // from the Server-Timing header: the server's own time, no network
   const statuses = new Map();
   let nextRequest = 0;
 
@@ -48,6 +49,7 @@ export async function runLoadTest({
       nextRequest += 1;
       const result = await client.postWebhook(buildWebhookPayload({}, 'load'));
       latencies.push(result.elapsedMs);
+      if (result.serverMs !== undefined) serverLatencies.push(result.serverMs);
       statuses.set(result.status, (statuses.get(result.status) ?? 0) + 1);
     }
   };
@@ -68,11 +70,19 @@ export async function runLoadTest({
       `p90 ${formatMs(summary.p90)} | p95 ${formatMs(summary.p95)} | ` +
       `p99 ${formatMs(summary.p99)} | max ${formatMs(summary.max)}`,
   );
+  const serverSummary = summarizeLatencies(serverLatencies);
+  if (serverLatencies.length > 0) {
+    log(
+      `  server only p50 ${formatMs(serverSummary.p50)} | p95 ${formatMs(serverSummary.p95)} | ` +
+        `max ${formatMs(serverSummary.max)}   (Server-Timing header; the difference is network)`,
+    );
+  }
   log(`  result      ${passed ? 'PASS' : 'FAIL'} (all 202 and p95 < ${maxP95Ms} ms)`);
 
   return {
     passed,
     summary,
+    serverSummary,
     statuses: Object.fromEntries(statuses),
     requestsPerSecond: requests / seconds,
   };

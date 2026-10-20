@@ -14,7 +14,12 @@ if (existsSync('.env')) process.loadEnvFile('.env');
 async function main() {
   const config = parseDatabaseConfig(process.env);
   const url = config.DATABASE_URL_DIRECT ?? config.DATABASE_URL;
-  const pool = createPool(url, { ssl: config.DB_SSL === 'require', max: 1 });
+  // Generous connection timeout: migrations run from a laptop or a CI runner far from the database.
+  const pool = createPool(url, {
+    ssl: config.DB_SSL === 'require',
+    max: 1,
+    connectionTimeoutMillis: 20_000,
+  });
 
   try {
     const { applied, skipped } = await runMigrations(pool, resolve('migrations'));

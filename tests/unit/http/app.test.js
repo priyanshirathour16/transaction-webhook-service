@@ -301,6 +301,40 @@ describe('unknown routes', () => {
   });
 });
 
+describe('Server-Timing header', () => {
+  const FORMAT = /^app;dur=\d+(\.\d)?$/;
+
+  it('reports the application time on successful responses', async () => {
+    const health = await sendRequest(app, { method: 'GET', url: '/' });
+    const accepted = await post(valid);
+
+    expect(health.headers['server-timing']).toMatch(FORMAT);
+    expect(accepted.headers['server-timing']).toMatch(FORMAT);
+  });
+
+  it('is also present on errors and 404s, so slow failures are visible too', async () => {
+    const invalid = await post({ nonsense: true });
+    const missing = await sendRequest(app, { method: 'GET', url: '/nope' });
+
+    expect(invalid.statusCode).toBe(400);
+    expect(invalid.headers['server-timing']).toMatch(FORMAT);
+    expect(missing.statusCode).toBe(404);
+    expect(missing.headers['server-timing']).toMatch(FORMAT);
+  });
+
+  it('measures real time: a slow handler shows a correspondingly larger duration', async () => {
+    transactionsService.receiveWebhook.mockImplementation(
+      () => new Promise((done) => setTimeout(() => done({ duplicate: false }), 60)),
+    );
+
+    const res = await post(valid);
+
+    const duration = Number(/dur=([\d.]+)/.exec(res.headers['server-timing'])[1]);
+    expect(duration).toBeGreaterThanOrEqual(55);
+    expect(duration).toBeLessThan(1000);
+  });
+});
+
 describe('edge cases', () => {
   it('health check uses the real clock when none is injected', async () => {
     const realClockApp = createApp({ transactionsService, logger: silentLogger });

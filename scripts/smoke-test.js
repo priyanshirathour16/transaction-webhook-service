@@ -128,10 +128,12 @@ export async function runSmokeTest({
   // ---- 3. Performance --------------------------------------------------------------------
   section('3. Performance (acknowledgement latency while earlier work is still pending)');
   const timings = [];
+  const serverTimings = []; // what the server says it spent; the rest of each timing is the network
   let rejected = 0;
   for (let i = 0; i < sequentialRequests; i += 1) {
     const r = await client.postWebhook(buildWebhookPayload());
     timings.push(r.elapsedMs);
+    if (r.serverMs !== undefined) serverTimings.push(r.serverMs);
     if (r.status !== 202) rejected += 1;
   }
   const concurrent = await Promise.all(
@@ -139,13 +141,21 @@ export async function runSmokeTest({
   );
   for (const r of concurrent) {
     timings.push(r.elapsedMs);
+    if (r.serverMs !== undefined) serverTimings.push(r.serverMs);
     if (r.status !== 202) rejected += 1;
   }
   const latency = summarizeLatencies(timings);
   log(
-    `  info  ${latency.count} requests: p50 ${formatMs(latency.p50)}, p95 ${formatMs(latency.p95)}, ` +
+    `  info  ${latency.count} requests, end to end: p50 ${formatMs(latency.p50)}, p95 ${formatMs(latency.p95)}, ` +
       `p99 ${formatMs(latency.p99)}, max ${formatMs(latency.max)}`,
   );
+  if (serverTimings.length > 0) {
+    const server = summarizeLatencies(serverTimings);
+    log(
+      `  info  server-side only (Server-Timing header): p50 ${formatMs(server.p50)}, ` +
+        `p95 ${formatMs(server.p95)}, max ${formatMs(server.max)}. The rest of the end-to-end time is network travel`,
+    );
+  }
   check(`all ${latency.count} requests answered 202`, rejected === 0, `${rejected} rejected`);
   check(`p95 acknowledgement < ${maxAckMs} ms`, latency.p95 < maxAckMs, formatMs(latency.p95));
 

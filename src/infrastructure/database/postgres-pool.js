@@ -5,9 +5,15 @@ import { getLogger } from '#src/infrastructure/logging/logger.js';
 /** @type {pg.Pool | undefined} */
 let pool;
 
+// The application runs next to its database, so a connection that takes longer than this is a
+// fault worth failing fast on (the webhook has a 500 ms budget).
+export const DEFAULT_CONNECTION_TIMEOUT_MS = 3_000;
+
 /**
  * @param {string} connectionString
- * @param {{ ssl: boolean, max: number }} opts
+ * @param {{ ssl: boolean, max: number, connectionTimeoutMillis?: number }} opts
+ *        `connectionTimeoutMillis`: command-line tools run from far away (a laptop on another
+ *        continent) pass a larger value, because opening a TLS connection takes many round trips.
  * @returns {pg.Pool}
  */
 export function createPool(connectionString, opts) {
@@ -17,7 +23,7 @@ export function createPool(connectionString, opts) {
     // Supabase's pooler presents a certificate chain Node does not trust by default.
     // Traffic is still encrypted; for stricter verification supply Supabase's CA via `ssl.ca`.
     ssl: opts.ssl ? { rejectUnauthorized: false } : false,
-    connectionTimeoutMillis: 3_000,
+    connectionTimeoutMillis: opts.connectionTimeoutMillis ?? DEFAULT_CONNECTION_TIMEOUT_MS,
     idleTimeoutMillis: 30_000,
     // Fail fast instead of hanging the 500 ms webhook path on a slow query.
     statement_timeout: 5_000,

@@ -200,7 +200,7 @@ npm run test:integration # real Postgres (npm run db:up first)
 npm run test:coverage    # with a coverage report in ./coverage
 ```
 
-**198 tests, ~99% statement and 100% line coverage** (thresholds are enforced). They include:
+**208 tests, ~99% statement and 100% line coverage** (thresholds are enforced). They include:
 
 - **Concurrency:** 50 simultaneous identical webhooks produce exactly one row and one queued job; 5 simultaneous
   deliveries of one job run the processor once.
@@ -248,6 +248,23 @@ npm run load-test -- --url https://<api> --connections 5 --requests 300
 |---|---|
 | Local dev server, 5 connections, 500 requests | all `202`; p50 31 ms, p95 59 ms, p99 66 ms, max 117 ms; ~140 req/s |
 | **Deployed on AWS** | 🔧 _To be measured and recorded after deployment, including the cold-start (first request) latency._ |
+
+**Reading latency numbers: server time vs network time.** A request's total time is network travel plus the server's
+own work. Every response carries a standard `Server-Timing: app;dur=…` header with the application's own time in
+milliseconds (it excludes network travel and a Lambda cold start), so the two can be told apart:
+
+```bash
+# the server's own time for this request
+curl -si https://<api>/ | grep -i server-timing
+
+# the full breakdown as a client sees it (DNS, TCP, TLS handshake, first byte, total)
+curl -s -o /dev/null https://<api>/ \
+  -w 'dns %{time_namelookup}s | tcp %{time_connect}s | tls %{time_appconnect}s | first byte %{time_starttransfer}s | total %{time_total}s\n'
+```
+
+The smoke and load tests print both the end-to-end and the server-side figures. The service runs in Sydney, so a
+caller far away pays several network round trips before the server even starts (a fresh HTTPS connection needs about
+three), and a network round trip of 150 to 400 ms is enough to consume most of a 500 ms budget by itself.
 
 > Local numbers show the application code is fast; they are **not** a prediction of AWS latency. The first request
 > to a cold Lambda also pays for starting the function and opening the database connection, which is the main

@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import onHeaders from 'on-headers';
 import { LOG_EVENT } from '#src/constants/log-events.js';
 
 const REQUEST_ID_HEADER = 'x-request-id';
@@ -8,7 +9,8 @@ const SAFE_REQUEST_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 
 /**
  * Gives every request an id (`req.id`), a child logger carrying it (`req.log`), the
- * `x-request-id` response header, and emits one structured access-log line when it finishes.
+ * `x-request-id` and `Server-Timing` response headers, and emits one structured access-log line
+ * when it finishes.
  *
  * @param {{ logger: import('pino').Logger }} deps
  * @returns {import('express').RequestHandler}
@@ -21,6 +23,15 @@ export function createRequestContextMiddleware({ logger }) {
     res.set(REQUEST_ID_HEADER, req.id);
 
     const startedAt = process.hrtime.bigint();
+
+    // Standard `Server-Timing` header: how long the application itself spent, as a number anyone
+    // can read in `curl -i` or browser dev tools. It excludes network travel and any Lambda cold
+    // start, so it separates "slow server" from "far-away client".
+    onHeaders(res, () => {
+      const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+      res.setHeader('Server-Timing', `app;dur=${elapsedMs.toFixed(1)}`);
+    });
+
     res.on('finish', () => {
       req.log.info({
         event: LOG_EVENT.REQUEST_COMPLETED,

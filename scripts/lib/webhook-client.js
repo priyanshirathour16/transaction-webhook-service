@@ -17,6 +17,16 @@ export function buildWebhookPayload(overrides = {}, prefix = 'smoke') {
 }
 
 /**
+ * Milliseconds the server reports for itself in a `Server-Timing: app;dur=12.3` header.
+ * @param {string | null | undefined} header
+ * @returns {number | undefined}
+ */
+export function parseServerTiming(header) {
+  const match = /(?:^|,)\s*app;(?:[^,]*;)?dur=([0-9]+(?:\.[0-9]+)?)/.exec(header ?? '');
+  return match ? Number(match[1]) : undefined;
+}
+
+/**
  * Minimal HTTP client for the service, with latency measurement. Every call resolves (never
  * rejects) with `{ status, elapsedMs, json, error }` so callers can assert instead of try/catch.
  *
@@ -41,7 +51,14 @@ export function createWebhookClient({ baseUrl, secret, timeoutMs = 15_000 }) {
       } catch {
         json = undefined;
       }
-      return { status: response.status, elapsedMs: performance.now() - started, json, text };
+      return {
+        status: response.status,
+        elapsedMs: performance.now() - started,
+        // What the server says it spent; the rest of elapsedMs is network and TLS.
+        serverMs: parseServerTiming(response.headers.get('server-timing')),
+        json,
+        text,
+      };
     } catch (error) {
       return { status: 0, elapsedMs: performance.now() - started, error: String(error) };
     }

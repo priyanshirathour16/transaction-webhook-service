@@ -2,6 +2,7 @@ import { createPool } from '#src/infrastructure/database/postgres-pool.js';
 import { median } from './stats.js';
 
 const WARM_SAMPLES = 5;
+const CLI_CONNECTION_TIMEOUT_MS = 20_000;
 
 /** Hides the password (and anything else secret-looking) in a message that might quote the URL. */
 export function redact(message, url) {
@@ -66,7 +67,9 @@ export async function checkDatabase({ url, ssl, expectedRegion }) {
 
   let pool;
   try {
-    pool = createPool(url, { ssl, max: 1 });
+    // Forgiving timeout: this tool is often run from far away, and a slow connection should be
+    // reported as slow, not as failed.
+    pool = createPool(url, { ssl, max: 1, connectionTimeoutMillis: CLI_CONNECTION_TIMEOUT_MS });
 
     // Cold: opening the connection (TLS + authentication) and the first query.
     const coldStart = performance.now();
