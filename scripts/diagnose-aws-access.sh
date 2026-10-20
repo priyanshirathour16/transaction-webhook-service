@@ -11,12 +11,12 @@
 #   our IAM      the deploy user's own policy lacks it: fixable in infra/github-deploy-access.yaml
 #   authorized   permission was granted; the call failed for an unrelated reason
 #
-# Environment: AWS_REGIONS (comma-separated, default AWS_REGION or ap-south-1), STACK_NAME.
+# Environment: AWS_REGIONS (comma-separated, default AWS_REGION or ap-southeast-2), STACK_NAME.
 # Run it from the "Diagnose AWS access" GitHub workflow (credentials come from the environment).
 
 set -uo pipefail
 
-REGIONS="${AWS_REGIONS:-${AWS_REGION:-ap-south-1}}"
+REGIONS="${AWS_REGIONS:-${AWS_REGION:-ap-southeast-2}}"
 STACK="${STACK_NAME:-transaction-webhook-service}"
 PROBE="${STACK}-probe"
 TEMPLATE='{"Resources":{"Probe":{"Type":"AWS::CloudFormation::WaitConditionHandle"}}}'

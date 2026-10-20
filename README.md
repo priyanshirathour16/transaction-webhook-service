@@ -8,11 +8,11 @@ Built with Node.js (Express 5) on AWS Lambda, SQS and Supabase Postgres.
 
 | | |
 |---|---|
-| **Public API** | 🔧 _Filled in after deployment (Phase 8):_ `https://<id>.lambda-url.ap-south-1.on.aws` |
+| **Public API** | 🔧 _Filled in after deployment (Phase 8):_ `https://<id>.lambda-url.ap-southeast-2.on.aws` |
 | **Health check** | `GET /` |
 | **Webhook** | `POST /v1/webhooks/transactions` → `202` |
 | **Query (for testing)** | `GET /v1/transactions/{transaction_id}` |
-| **Region** | `ap-south-1` (Mumbai) for AWS and Supabase |
+| **Region** | `ap-southeast-2` (Sydney) for AWS and Supabase. The AWS account's organization policy only permits certain regions (Mumbai is blocked); see [Diagnosing AWS restrictions](#diagnosing-aws-restrictions). |
 
 ## Contents
 
@@ -394,7 +394,7 @@ sam deploy --guided                                   # first time; afterwards: 
 `npm run db:check` tests both connection strings the way the app uses them (`DATABASE_URL` and
 `DATABASE_URL_DIRECT`, from the environment or `.env`): whether each connects, how fast it answers, whether a
 multi-statement transaction works through the pooler, whether the schema exists, and whether the database sits in the
-same region as the application (`EXPECTED_DB_REGION`, default `ap-south-1`). Passwords are never printed. Run it before
+same region as the application (`EXPECTED_DB_REGION`, default `ap-southeast-2`). Passwords are never printed. Run it before
 the first deploy and whenever a connection problem is suspected.
 
 ### Diagnosing AWS restrictions
