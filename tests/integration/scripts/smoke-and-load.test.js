@@ -21,6 +21,13 @@ const SECRET = 'integration-secret-value';
 let pool;
 let server;
 let baseUrl;
+let app;
+let distantServer; // the same app behind a proxy that adds network distance
+let distantUrl;
+
+// One-way "distance" added before the app even sees a request. The app's own Server-Timing is
+// unaffected, but the client's end-to-end time grows by this much.
+const NETWORK_DELAY_MS = 300;
 
 const quietLog = () => {};
 
@@ -49,18 +56,21 @@ beforeAll(async () => {
     transactionsService.processTransaction({ transactionId, isFinalAttempt: false }),
   );
 
-  server = await listen(
-    createApp({
-      transactionsService,
-      logger: createSilentLogger(),
-      webhookSecret: SECRET,
-    }),
-  );
+  app = createApp({
+    transactionsService,
+    logger: createSilentLogger(),
+    webhookSecret: SECRET,
+  });
+  server = await listen(app);
   baseUrl = urlOf(server);
+
+  distantServer = await listen((req, res) => setTimeout(() => app(req, res), NETWORK_DELAY_MS));
+  distantUrl = urlOf(distantServer);
 });
 
 afterAll(async () => {
   await new Promise((done) => server.close(done));
+  await new Promise((done) => distantServer.close(done));
   await pool.end();
 });
 
@@ -185,5 +195,89 @@ describe('load-test script', () => {
     });
 
     expect(result.passed).toBe(false);
+  }, 60_000);
+});
+
+describe('a client far from the service (network distance is not the server being slow)', () => {
+  // Budget with a wide margin on both sides: far above the app's own time (a few ms, even on a
+  // busy machine) and below the end-to-end time (>= NETWORK_DELAY_MS).
+  const BUDGET_MS = 250;
+
+  it('smoke test: passes on the server-side time and only WARNS about end-to-end time', async () => {
+    const result = await runSmokeTest({
+      baseUrl: distantUrl,
+      secret: SECRET,
+      expectedDelaySeconds: 1,
+      maxAckMs: BUDGET_MS,
+      sequentialRequests: 8,
+      concurrentRequests: 2,
+      pollIntervalMs: 100,
+      log: quietLog,
+    });
+
+    const failed = result.checks.filter((c) => !c.ok).map((c) => `${c.name} (${c.detail})`);
+    expect(failed).toEqual([]);
+    expect(result.passed).toBe(true);
+    expect(result.checks.some((c) => c.name.startsWith('server-side p95'))).toBe(true);
+    expect(result.warnings.join(' ')).toMatch(/end-to-end p95 .*network travel/);
+  }, 60_000);
+
+  it('smoke test: --strict-e2e holds the end-to-end time to the budget and fails', async () => {
+    const result = await runSmokeTest({
+      baseUrl: distantUrl,
+      secret: SECRET,
+      expectedDelaySeconds: 1,
+      maxAckMs: BUDGET_MS,
+      strictEndToEnd: true,
+      sequentialRequests: 8,
+      concurrentRequests: 2,
+      pollIntervalMs: 100,
+      log: quietLog,
+    });
+
+    expect(result.passed).toBe(false);
+    const failed = result.checks.filter((c) => !c.ok).map((c) => c.name);
+    expect(failed).toEqual([expect.stringContaining('end-to-end p95')]);
+  }, 60_000);
+
+  it('smoke test: still fails when the SERVER is the slow part', async () => {
+    const result = await runSmokeTest({
+      baseUrl: distantUrl,
+      secret: SECRET,
+      expectedDelaySeconds: 1,
+      maxAckMs: 0.5, // the app cannot answer in half a millisecond
+      sequentialRequests: 4,
+      concurrentRequests: 1,
+      pollIntervalMs: 100,
+      log: quietLog,
+    });
+
+    expect(result.passed).toBe(false);
+    expect(result.checks.find((c) => c.name.startsWith('server-side p95')).ok).toBe(false);
+  }, 60_000);
+
+  it('load test: gates on server-side time, and --strict-e2e adds the end-to-end gate', async () => {
+    const lenient = await runLoadTest({
+      baseUrl: distantUrl,
+      secret: SECRET,
+      connections: 2,
+      requests: 10,
+      maxP95Ms: BUDGET_MS,
+      log: quietLog,
+    });
+    expect(lenient.passed).toBe(true);
+    expect(lenient.summary.p95).toBeGreaterThanOrEqual(NETWORK_DELAY_MS);
+    expect(lenient.serverSummary.p95).toBeLessThan(BUDGET_MS);
+
+    const strict = await runLoadTest({
+      baseUrl: distantUrl,
+      secret: SECRET,
+      connections: 2,
+      requests: 10,
+      maxP95Ms: BUDGET_MS,
+      strictEndToEnd: true,
+      log: quietLog,
+    });
+    expect(strict.passed).toBe(false);
   }, 60_000);
 });

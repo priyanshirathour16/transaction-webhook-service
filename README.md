@@ -8,7 +8,7 @@ Built with Node.js (Express 5) on AWS Lambda, SQS and Supabase Postgres.
 
 | | |
 |---|---|
-| **Public API** | 🔧 _Filled in after deployment (Phase 8):_ `https://<id>.lambda-url.ap-southeast-2.on.aws` |
+| **Public API** | **https://xr4owskbawbjsmihvcdnk7w5i40ilffm.lambda-url.ap-southeast-2.on.aws** |
 | **Health check** | `GET /` |
 | **Webhook** | `POST /v1/webhooks/transactions` → `202` |
 | **Query (for testing)** | `GET /v1/transactions/{transaction_id}` |
@@ -200,7 +200,7 @@ npm run test:integration # real Postgres (npm run db:up first)
 npm run test:coverage    # with a coverage report in ./coverage
 ```
 
-**208 tests, ~99% statement and 100% line coverage** (thresholds are enforced). They include:
+**215 tests, ~99% statement and 100% line coverage** (thresholds are enforced). They include:
 
 - **Concurrency:** 50 simultaneous identical webhooks produce exactly one row and one queued job; 5 simultaneous
   deliveries of one job run the processor once.
@@ -222,7 +222,7 @@ npm run smoke -- --url https://<api>                 # add --secret <s> if signa
 |---|---|---|
 | 1 | **Single transaction** | Sends one webhook, expects `202`, then `PROCESSING`, then `PROCESSED` about 30 s later; checks `processed_at − created_at ≈ 30 s`. |
 | 2 | **Duplicate prevention** | Sends the same webhook 10× at once: all `202`, exactly one `duplicate:false`; replays after processing and checks the record is unchanged. |
-| 3 | **Performance** | 35 more webhooks while earlier work is still pending: all `202`, **p95 < 500 ms**. |
+| 3 | **Performance** | 35 more webhooks while earlier work is still pending: all `202`, and the **server-side p95 < 500 ms** (the application's own time, from the `Server-Timing` header). End-to-end time is printed too; it also contains the network distance from wherever the test runs, so it only fails the run with `--strict-e2e`. |
 | 4 | **Reliability** | Invalid body → `400`, broken JSON → `400`, wrong content type → `415`, unknown id → `404`, unsigned → `401` (if a secret is set). |
 
 The same by hand:
@@ -247,7 +247,7 @@ npm run load-test -- --url https://<api> --connections 5 --requests 300
 | Where | Result |
 |---|---|
 | Local dev server, 5 connections, 500 requests | all `202`; p50 31 ms, p95 59 ms, p99 66 ms, max 117 ms; ~140 req/s |
-| **Deployed on AWS** | 🔧 _To be measured and recorded after deployment, including the cold-start (first request) latency._ |
+| **Deployed on AWS (Sydney)**, smoke test from a GitHub Actions runner far from Sydney | all `202`. **Server-side** (Server-Timing): p50 **18 ms**, p95 **137 ms**, max 152 ms. **End to end**: p50 186 ms, p95 599 ms (about 170 ms of network round trip per request; a fresh HTTPS connection costs about three). First request after the deploy, **a cold Lambda plus a new connection: 809 ms**. Background processing finished **31.5 s** after creation. |
 
 **Reading latency numbers: server time vs network time.** A request's total time is network travel plus the server's
 own work. Every response carries a standard `Server-Timing: app;dur=…` header with the application's own time in
@@ -449,7 +449,13 @@ CloudWatch Logs Insights: `fields @timestamp, event, transaction_id, request_id 
 - **Cold start.** The first request to a cold Lambda includes starting the function and opening the database
   connection, and may exceed 500 ms. Mitigations in place: same region for AWS and Supabase, a small bundle, a
   warm-up ping every 5 minutes, one reused connection. Provisioned concurrency would remove it but is not free.
-  _The deployed figure is recorded above once measured._
+  _Measured on the deployed service: the first request took 809 ms end to end (see the results table above)._
+- **Network distance counts against the 500 ms budget.** The AWS account's organization permits regional services only in
+  a few regions, and the closest to India is Sydney. A caller far from Sydney pays a network round trip on every
+  request, and a brand-new HTTPS connection costs about three of them, so end-to-end time from far away can exceed
+  500 ms even though the application itself answers in tens of milliseconds (see `Server-Timing`). Putting a CDN in
+  front (for example CloudFront, which terminates the connection near the caller) is the standard remedy and would be
+  the next step, subject to the organization allowing it.
 - **The acknowledgement waits for the database and queue.** That is deliberate (nothing is acknowledged unless it is
   safe). If cold starts proved too slow, the alternative is to queue first and let the worker write to the database.
 - **Brand-new AWS accounts** may be limited to ~10 concurrent Lambda executions; worker concurrency is capped

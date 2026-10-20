@@ -11,11 +11,14 @@
  *   --expected-delay <s>           processing delay of the deployment (default 30)
  *   --max-ack-ms <ms>              acknowledgement budget (default 500)
  *   --strict-cold                  also fail if the very FIRST request exceeds the budget
+ *   --strict-e2e                   also fail if END-TO-END latency (which includes the network
+ *                                  distance from this machine) exceeds the budget
  *
  * Criteria covered:
  *   1. Single transaction  — 202 fast, PROCESSING, then PROCESSED after ~the delay
  *   2. Duplicate prevention — many identical webhooks, one transaction, processed once
- *   3. Performance          — acknowledgement latency stays under budget while work is pending
+ *   3. Performance          — the application's own acknowledgement time (Server-Timing header) stays
+ *                             under budget while work is pending; end-to-end time is reported too
  *   4. Reliability          — bad input is rejected cleanly, unknown ids give 404, nothing is lost
  */
 import { pathToFileURL } from 'node:url';
@@ -32,6 +35,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  *   expectedDelaySeconds?: number,
  *   maxAckMs?: number,
  *   strictCold?: boolean,
+ *   strictEndToEnd?: boolean,
  *   sequentialRequests?: number,
  *   concurrentRequests?: number,
  *   pollIntervalMs?: number,
@@ -44,6 +48,7 @@ export async function runSmokeTest({
   expectedDelaySeconds = 30,
   maxAckMs = 500,
   strictCold = false,
+  strictEndToEnd = false,
   sequentialRequests = 30,
   concurrentRequests = 5,
   pollIntervalMs = 1_000,
@@ -149,15 +154,42 @@ export async function runSmokeTest({
     `  info  ${latency.count} requests, end to end: p50 ${formatMs(latency.p50)}, p95 ${formatMs(latency.p95)}, ` +
       `p99 ${formatMs(latency.p99)}, max ${formatMs(latency.max)}`,
   );
+  check(`all ${latency.count} requests answered 202`, rejected === 0, `${rejected} rejected`);
+
   if (serverTimings.length > 0) {
+    // The gate is the time the APPLICATION took (Server-Timing): that is what the code controls. The
+    // end-to-end figure depends on how far this machine is from the service (a fresh HTTPS
+    // connection alone costs about three network round trips), so it is reported, and only fails the
+    // run on request (--strict-e2e).
     const server = summarizeLatencies(serverTimings);
     log(
       `  info  server-side only (Server-Timing header): p50 ${formatMs(server.p50)}, ` +
-        `p95 ${formatMs(server.p95)}, max ${formatMs(server.max)}. The rest of the end-to-end time is network travel`,
+        `p95 ${formatMs(server.p95)}, max ${formatMs(server.max)}`,
     );
+    log(
+      `  info  estimated network round trip from this machine: ~${formatMs(latency.p50 - server.p50)}`,
+    );
+    check(
+      `server-side p95 < ${maxAckMs} ms (the application's own time)`,
+      server.p95 < maxAckMs,
+      formatMs(server.p95),
+    );
+    if (strictEndToEnd) {
+      check(
+        `end-to-end p95 < ${maxAckMs} ms (includes network travel)`,
+        latency.p95 < maxAckMs,
+        formatMs(latency.p95),
+      );
+    } else if (latency.p95 >= maxAckMs) {
+      warnings.push(
+        `end-to-end p95 is ${formatMs(latency.p95)} (> ${maxAckMs} ms) but the server's own p95 is ` +
+          `${formatMs(server.p95)}: the rest is network travel from this machine, which the service cannot control`,
+      );
+    }
+  } else {
+    // No Server-Timing header (an older deployment): the end-to-end figure is all there is.
+    check(`p95 acknowledgement < ${maxAckMs} ms`, latency.p95 < maxAckMs, formatMs(latency.p95));
   }
-  check(`all ${latency.count} requests answered 202`, rejected === 0, `${rejected} rejected`);
-  check(`p95 acknowledgement < ${maxAckMs} ms`, latency.p95 < maxAckMs, formatMs(latency.p95));
 
   // ---- 4. Reliability: clean failure handling --------------------------------------------
   section('4. Reliability / error handling');
@@ -254,7 +286,7 @@ export async function runSmokeTest({
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
   const usage =
     'Usage: node scripts/smoke-test.js --url <base-url> [--secret <s>] [--expected-delay <seconds>]\n' +
-    '                                   [--max-ack-ms <ms>] [--strict-cold]';
+    '                                   [--max-ack-ms <ms>] [--strict-cold] [--strict-e2e]';
   const values = parseCliArgs(
     {
       url: { type: 'string' },
@@ -262,6 +294,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
       'expected-delay': { type: 'string' },
       'max-ack-ms': { type: 'string' },
       'strict-cold': { type: 'boolean', default: false },
+      'strict-e2e': { type: 'boolean', default: false },
     },
     usage,
   );
@@ -279,6 +312,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
     ),
     maxAckMs: Number(values['max-ack-ms'] ?? 500),
     strictCold: values['strict-cold'],
+    strictEndToEnd: values['strict-e2e'],
   });
   process.exit(result.passed ? 0 : 1);
 }

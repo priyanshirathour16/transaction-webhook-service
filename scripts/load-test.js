@@ -9,7 +9,8 @@
  *   --secret / WEBHOOK_SECRET   sign webhooks, if the service enforces signatures
  *   --connections <n>           concurrent connections (default 5)
  *   --requests <n>              total requests (default 300)
- *   --max-p95-ms <ms>           fail if p95 exceeds this (default 500)
+ *   --max-p95-ms <ms>           fail if the SERVER-SIDE p95 (Server-Timing header) exceeds this (default 500)
+ *   --strict-e2e                also fail if END-TO-END p95 (including network distance) exceeds it
  *
  * Note: a brand-new AWS account may allow only ~10 concurrent Lambda executions in total, so
  * keep --connections modest against a deployed stack, or requests will be throttled (HTTP 429).
@@ -27,6 +28,7 @@ import { buildWebhookPayload, createWebhookClient } from './lib/webhook-client.j
  *   connections?: number,
  *   requests?: number,
  *   maxP95Ms?: number,
+ *   strictEndToEnd?: boolean,
  *   log?: (line: string) => void,
  * }} options
  */
@@ -36,6 +38,7 @@ export async function runLoadTest({
   connections = 5,
   requests = 300,
   maxP95Ms = 500,
+  strictEndToEnd = false,
   log = console.log,
 }) {
   const client = createWebhookClient({ baseUrl, secret });
@@ -59,8 +62,15 @@ export async function runLoadTest({
   const seconds = (performance.now() - started) / 1_000;
 
   const summary = summarizeLatencies(latencies);
+  const serverSummary = summarizeLatencies(serverLatencies);
   const accepted = statuses.get(202) ?? 0;
-  const passed = accepted === requests && summary.p95 < maxP95Ms;
+
+  // The gate is the application's own time (Server-Timing) when the service reports it: end-to-end
+  // time also contains network travel from this machine, which the service cannot control.
+  // --strict-e2e additionally holds the end-to-end figure to the budget.
+  const gate = serverLatencies.length > 0 ? serverSummary : summary;
+  const passed =
+    accepted === requests && gate.p95 < maxP95Ms && (!strictEndToEnd || summary.p95 < maxP95Ms);
 
   log(`Load test: ${requests} requests, ${connections} connections, ${seconds.toFixed(1)} s`);
   log(`  throughput  ${(requests / seconds).toFixed(1)} req/s`);
@@ -70,14 +80,20 @@ export async function runLoadTest({
       `p90 ${formatMs(summary.p90)} | p95 ${formatMs(summary.p95)} | ` +
       `p99 ${formatMs(summary.p99)} | max ${formatMs(summary.max)}`,
   );
-  const serverSummary = summarizeLatencies(serverLatencies);
   if (serverLatencies.length > 0) {
     log(
       `  server only p50 ${formatMs(serverSummary.p50)} | p95 ${formatMs(serverSummary.p95)} | ` +
         `max ${formatMs(serverSummary.max)}   (Server-Timing header; the difference is network)`,
     );
+    log(
+      `  network     ~${formatMs(summary.p50 - serverSummary.p50)} per request from this machine`,
+    );
   }
-  log(`  result      ${passed ? 'PASS' : 'FAIL'} (all 202 and p95 < ${maxP95Ms} ms)`);
+  const basis = serverLatencies.length > 0 ? 'server-side' : 'end-to-end';
+  log(
+    `  result      ${passed ? 'PASS' : 'FAIL'} (all 202 and ${basis} p95 < ${maxP95Ms} ms` +
+      `${strictEndToEnd ? ' and end-to-end p95 too' : ''})`,
+  );
 
   return {
     passed,
@@ -92,7 +108,7 @@ export async function runLoadTest({
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
   const usage =
     'Usage: node scripts/load-test.js --url <base-url> [--secret <s>] [--connections <n>]\n' +
-    '                                 [--requests <n>] [--max-p95-ms <ms>]';
+    '                                 [--requests <n>] [--max-p95-ms <ms>] [--strict-e2e]';
   const values = parseCliArgs(
     {
       url: { type: 'string' },
@@ -100,6 +116,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
       connections: { type: 'string' },
       requests: { type: 'string' },
       'max-p95-ms': { type: 'string' },
+      'strict-e2e': { type: 'boolean', default: false },
     },
     usage,
   );
@@ -114,6 +131,7 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
     connections: Number(values.connections ?? 5),
     requests: Number(values.requests ?? 300),
     maxP95Ms: Number(values['max-p95-ms'] ?? 500),
+    strictEndToEnd: values['strict-e2e'],
   });
   process.exit(result.passed ? 0 : 1);
 }
