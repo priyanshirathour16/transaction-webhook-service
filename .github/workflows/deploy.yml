@@ -80,7 +80,21 @@ jobs:
       - name: Build
         run: sam build
 
+      # A FIRST deployment that fails rolls back and leaves the stack in ROLLBACK_COMPLETE, which
+      # CloudFormation can never update. Delete such an empty shell so the retry starts clean.
+      - name: Remove a stack left behind by a failed first deployment
+        run: |
+          status=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo NONE)
+          echo "Stack status: $status"
+          if [ "$status" = "ROLLBACK_COMPLETE" ]; then
+            echo "Deleting the rolled-back stack before retrying."
+            aws cloudformation delete-stack --stack-name "$STACK_NAME"
+            aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
+          fi
+
       - name: Deploy
+        id: deploy
         run: |
           overrides=("DatabaseUrl=$DATABASE_URL" "AlertEmail=$ALERT_EMAIL")
           # WEBHOOK_SECRET is optional. SAM rejects an empty "Name=" override, so only pass it when set.
@@ -98,6 +112,20 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+
+      # Put the reason on the run's Summary page so nobody has to dig through the log.
+      - name: Explain a failed deployment
+        if: failure() && steps.deploy.conclusion == 'failure'
+        run: |
+          {
+            echo "### Deployment failed: the CloudFormation events that failed"
+            echo
+            echo '```'
+            aws cloudformation describe-stack-events --stack-name "$STACK_NAME" \
+              --query "StackEvents[?contains(ResourceStatus, 'FAILED')].[Timestamp,LogicalResourceId,ResourceStatus,ResourceStatusReason]" \
+              --output text 2>&1 || echo "(no stack events: the failure happened before the stack was created)"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Read the public URL from the stack outputs
         id: stack
