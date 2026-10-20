@@ -343,11 +343,14 @@ src/
   infrastructure/            database/ (pool, migrator)   queue/ (SQS + in-memory)   logging/
   lib/                       framework-free helpers (webhook signature)
   handlers/                  AWS Lambda entry points: api, worker, reconciler
-scripts/                     command-line tools: migrate, dev-server, smoke-test, load-test
+scripts/                     command-line tools: migrate, dev-server, db:check, smoke-test, load-test,
+                             diagnose-aws-access (+ lib/ with their shared helpers)
 migrations/                  versioned SQL
 infra/                       one-time AWS setup: the deploy identity for GitHub Actions
+docs/                        deployment-guide.md (set up your own copy), design-and-plan.md (decisions and history)
 tests/                       mirrors src/ (unit + integration)
-template.yaml                the application's AWS infrastructure (SAM)
+.github/workflows/           ci.yml, deploy.yml, diagnose-aws-access.yml (+ dependabot.yml)
+template.yaml                the application's AWS infrastructure (SAM): functions, queues, alarms, CloudFront
 ```
 
 Conventions, enforced by ESLint/Prettier rather than just habit: `kebab-case` file names with a role suffix
@@ -382,7 +385,7 @@ Environment variables, validated at startup (the process refuses to start with a
 
 ## Deploy and operate
 
-Full account setup (AWS, Supabase, GitHub) is in [AWS_SETUP.md](AWS_SETUP.md). In short:
+Full account setup (AWS, Supabase, GitHub) is in [docs/deployment-guide.md](docs/deployment-guide.md). In short:
 
 **One-time** (as an AWS admin): create the stack in `infra/github-deploy-access.yaml`. It makes a least-privilege
 identity that can deploy only this application's resources, in one of two modes:

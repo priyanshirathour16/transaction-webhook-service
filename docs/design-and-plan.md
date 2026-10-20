@@ -1,6 +1,7 @@
-# Transaction Webhook Service — Implementation Plan
+# Transaction Webhook Service — Design and Plan
 
-> Status: **PLAN ONLY — no code written yet.** Review, then approve to start implementation.
+> Status: **implemented and deployed.** This document records the design, the decisions behind it and what was
+> learned while building it. The [README](../README.md) is the user-facing guide.
 
 ---
 
@@ -34,7 +35,7 @@ A service that receives payment-processor transaction webhooks (RazorPay-style),
 | Database | **Supabase Postgres** (via Supavisor pooler) | Your choice; strong constraints = bulletproof idempotency, `NUMERIC` for money |
 | IaC / deploy | **AWS SAM** | Simplest for Lambda + SQS + EventBridge |
 | Signature check | **Optional HMAC-SHA256**, enforced only when `WEBHOOK_SECRET` is set | Realistic for payment webhooks; does not break evaluator's plain POSTs |
-| Extras | **GitHub Actions CI/CD, unit + integration tests, observability** | Per your selection |
+| Extras | **GitHub Actions CI/CD, unit + integration tests, observability** | Quality and operations extras |
 | Region | **ap-southeast-2 (Sydney)** for AWS **and** Supabase | *Originally ap-south-1 (Mumbai) for the INR use case. Changed after a multi-region probe (`scripts/diagnose-aws-access.sh`) showed the account's AWS Organization blocks regional services in Mumbai, Singapore, Seoul, Ireland and Oregon. Sydney is the closest allowed region to India.* The database must stay in the same region as the Lambdas (critical for the 500 ms budget) |
 
 ### Alternatives considered (and why not)
@@ -85,7 +86,7 @@ flowchart LR
 `200 { "status": "HEALTHY", "current_time": "<ISO-8601 UTC>" }`. No DB call (must stay instant).
 
 ### `GET /v1/transactions/{transaction_id}`
-- `200` → **array** with one object (as per your spec): `transaction_id, source_account, destination_account, amount, currency, status (PROCESSING | PROCESSED | FAILED), created_at, processed_at (null while processing)`.
+- `200` → **array** with one object (as specified): `transaction_id, source_account, destination_account, amount, currency, status (PROCESSING | PROCESSED | FAILED), created_at, processed_at (null while processing)`.
 - `404` with empty array/`{error}` when unknown (assumption — see §14).
 
 ---
@@ -248,7 +249,7 @@ Design principle: **ports & adapters** — business logic depends on the reposit
 
 ---
 
-## 14. Assumptions (flag any you disagree with)
+## 14. Assumptions
 
 1. **Spec inconsistencies**: amount/currency examples differ (1500 INR vs 150.50 USD) → both valid; stored exactly as received.
 2. **Query returns an array** exactly as spec; unknown ID → `404`.
@@ -272,7 +273,7 @@ Design principle: **ports & adapters** — business logic depends on the reposit
 
 ## 16. Execution phases (checklist)
 
-- [ ] **Phase 0 – Accounts**: follow [AWS_SETUP.md](AWS_SETUP.md) — AWS account (note creation date), Supabase project in ap-southeast-2, GitHub public repo, AWS OIDC role, alert email.
+- [x] **Phase 0 – Accounts**: see the [deployment guide](deployment-guide.md) — AWS account (note creation date), Supabase project in ap-southeast-2, GitHub public repo, AWS OIDC role, alert email.
 - [x] **Phase 1 – Foundation**: JS project (ESM), lint/format, config, logger, DB module, migration #1. *(done: lint clean, 8 tests passing; migrations verified on local Postgres; converted from TypeScript to JavaScript)*
 - [x] **Phase 2 – Domain**: repository, queue port + adapters, transaction service (idempotency logic). *(done: 47 tests passing; concurrency tests mutation-checked. Added `REPAIR_GRACE_SECONDS` so a duplicate racing the original request does not double-enqueue; processing uses a row lock `SELECT … FOR UPDATE` instead of a bare conditional UPDATE so the external call runs at most once per commit)*
 - [x] **Phase 3 – API**: Express app (migrated from Fastify after Phase 5; same behaviour, 138 tests passing), three endpoints, validation, optional HMAC, error handling. *(originally done with 113 tests; verified with curl against a running local server. Added: Lambda handler `src/handlers/api.js` with warm-up ping, local dev server `npm run dev`. Decisions: 202 body is always `{status:"ACCEPTED", duplicate:bool}`; no type coercion; currency normalised to upper case; unknown id → 404 `{error:{code:"TRANSACTION_NOT_FOUND"}}`; non-JSON content type → 415)*
@@ -289,44 +290,8 @@ Design principle: **ports & adapters** — business logic depends on the reposit
   - **Region finding:** every regional service was blocked by an organization policy (SCP) in ap-south-1, and S3 in four other regions; Sydney and N. Virginia were not blocked. Note the probe's "our IAM" cells were inconclusive because our deploy permissions were scoped to Mumbai; a re-probe scoped to Sydney is needed for a definitive answer before deploying.
   - **Learned during Phase 8 setup:** the AWS account sits in an organization whose SCPs explicitly deny CloudShell and `iam:CreateOpenIDConnectProvider`. The keyless OIDC design was therefore replaced by an IAM-user mode (same template, `AccessMode=user`), and the stack is created from the CloudFormation console instead of CloudShell. Other SCP denials may still surface.
 - [x] **Phase 8 – Deploy & verify**: **DONE. Live at https://d2c87kyt7tmin7.cloudfront.net** (CloudFront in front of the Lambda in ap-southeast-2; the stack was recreated after the diagnostics incident below, which is why the URL differs from the first deployment). Verified from India through CloudFront: smoke test 19/19, webhook POSTs on fresh connections 0.36–0.46 s, processing 30.1 s after creation; direct-to-Lambda fresh connections were 0.97–0.99 s. A ~0.9 s tail remains when CloudFront opens a new origin connection (documented in the README). SNS alert subscription confirmed. History of this phase follows. First deployment: ap-southeast-2 (https://xr4owskbawbjsmihvcdnk7w5i40ilffm.lambda-url.ap-southeast-2.on.aws, now deleted). Smoke test on the live service passed 18/19; the one failure was end-to-end latency measured from the GitHub runner (p95 599 ms, of which the server's own p95 was 137 ms), so the smoke/load gate now uses the server-side `Server-Timing` figure and reports end-to-end separately. Verified independently from India: full webhook cycle works, processed 31.6 s after creation, but a new HTTPS connection to Sydney costs 1.0–2.3 s from there. Open items: confirm the SNS alarm email; decide whether to put CloudFront in front to cut connection cost for distant callers (needs the org to allow it). _Original task text:_ Create the deploy-access stack, set the GitHub secrets, push to GitHub, run the pipeline, then run the smoke test + load test against the live URL and record the real numbers (especially cold-start latency) in README.md.
-- [x] **Phase 9 – Docs**: README (run locally, test, endpoints with curl examples, tech choices, trade-offs, teardown) + AWS_SETUP.md. *(done; the live URL and deployed measurements are marked as pending in the README and must be filled in during Phase 8.)*
+- [x] **Phase 9 – Docs**: README (run locally, test, endpoints with curl examples, tech choices, trade-offs, teardown) + docs/deployment-guide.md. *(done; the live URL and deployed measurements are marked as pending in the README and must be filled in during Phase 8.)*
 ## 17. README outline (deliverable)
 1. Overview & architecture diagram  2. Live URL  3. Local run (docker-compose + in-memory queue)  4. Deploy (SAM)  5. Test guide with curl for the 4 success criteria  6. Technical choices & trade-offs  7. Reliability/idempotency explanation  8. Load-test results  9. Known limitations / next steps (outbox via CDC, real HMAC per provider, auth on query, API Gateway + WAF at higher scale).  10. **"How I used AI"** note: what I generated, what I reviewed/changed, how I verified (tests, load test, smoke test).
 
 ---
-
-## 18. Interview readiness (Round 2: live full-stack build + AWS deploy, AI allowed)
-
-**What Round 2 tests:** decisions, how you check AI output, how well you explain your code. This assessment is your rehearsal — same stack: Node + Supabase Postgres + AWS.
-
-### 18.1 Why this stack fits
-- Matches their checklist exactly: Node ≥ 18, Supabase, AWS Free plan, Git/GitHub, AI tool.
-- Lambda + Function URL + SQS + EventBridge are all available on the AWS Free plan and draw from credits, not your card.
-- Render's free tier sleeps after 15 min (~1 min wake-up) → would fail the 500 ms rule; so AWS is the right primary. Render/Netlify stay as **fallback** if AWS verification is delayed (guide says to tell them and describe the design on paper).
-
-### 18.2 Pre-interview checklist (mapped to this project)
-- [ ] **New AWS account on an email never used for AWS**, Free plan, created after July 2025 (older accounts may get no credits). Confirm ~$100 credits on the billing page; do the Explore-AWS tasks for up to +$100.
-- [ ] Root MFA on; **budget alert** set; **IAM user** for daily work (CI uses an OIDC role, never root keys).
-- [ ] **Supabase project created 1–2 days early**, region ap-southeast-2, DB password saved; open it the morning of the interview (free projects pause after a week idle; our reconciler also keeps it alive once deployed).
-- [ ] Tooling installed: Node 22, Git, VS Code, AWS CLI, **SAM CLI**, Docker (local Postgres), one AI tool logged in.
-- [ ] Supabase MCP (optional): connect **only to the test project**, read-only/project-scoped, **review every SQL before approving**; give up after 10 min and use the dashboard.
-- [ ] Laptop, charger, webcam, mic, headphones, stable internet.
-
-### 18.3 Scope decision: backend only
-The brief asks for a backend service only, so there is **no frontend** in this project. Effort goes into correctness, tests, deployment and the README instead. (For Round 2's frontend, practise separately.)
-
-### 18.4 Be ready to explain (one sentence each, with trade-off)
-1. Why queue + worker instead of processing in the request? (500 ms ack, durability, load levelling)
-2. How is idempotency guaranteed? (DB primary key + ON CONFLICT; worker conditional UPDATE; at-least-once SQS)
-3. What if the API dies between DB insert and SQS send? (retry repairs it; reconciler is the safety net; true outbox is the next step)
-4. Why SQS delay instead of sleeping 30 s? (no idle Lambda billing, survives restarts)
-5. Why Supabase pooler + pool size 1? (Lambda connection explosion; transaction-mode trade-offs)
-6. Why Lambda Function URL vs API Gateway? (free, simpler; trade-off: no WAF/throttling)
-7. Cold-start risk and measured p95/p99? (be honest, show load-test numbers)
-8. How would this scale 100×? (worker concurrency, partitioning, RDS Proxy/pgBouncer, batching, outbox/CDC)
-9. What did AI write, what did you verify or change? (have 2–3 concrete examples of AI output you corrected)
-
-### 18.5 Practice
-- Re-implement one small piece live without looking (e.g. the idempotent insert or the worker claim) so you can do it under interview pressure.
-- Run the whole 4-scenario demo (single, duplicate, burst, failure→DLQ) end-to-end in < 5 minutes.
-- Know where to look when something breaks: CloudWatch logs, SQS queue/DLQ depth, Supabase table editor.

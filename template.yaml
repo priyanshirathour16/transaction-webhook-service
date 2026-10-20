@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
   Transaction webhook service. Function URL -> API Lambda (202 fast) -> SQS (30 s delay) ->
-  worker Lambda -> Supabase Postgres. EventBridge reconciler heals lost jobs. See PLAN.md.
+  worker Lambda -> Supabase Postgres. EventBridge reconciler heals lost jobs. See docs/design-and-plan.md.
 
 Parameters:
   DatabaseUrl:
