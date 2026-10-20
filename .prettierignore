@@ -1,0 +1,7 @@
+node_modules
+dist
+coverage
+.aws-sam
+package-lock.json
+*.md
+template.yaml

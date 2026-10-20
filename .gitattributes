@@ -1,0 +1,3 @@
+# Normalise line endings so Windows and Linux (CI, Lambda build) produce identical diffs and hashes.
+* text=auto eol=lf
+*.sql text eol=lf

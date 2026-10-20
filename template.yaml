@@ -1,0 +1,401 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Transaction webhook service. Function URL -> API Lambda (202 fast) -> SQS (30 s delay) ->
+  worker Lambda -> Supabase Postgres. EventBridge reconciler heals lost jobs. See PLAN.md.
+
+Parameters:
+  DatabaseUrl:
+    Type: String
+    NoEcho: true
+    MinLength: 10
+    Description: Supabase TRANSACTION POOLER connection string (port 6543).
+  WebhookSecret:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: Optional. When set (min 8 chars), webhooks must carry a valid HMAC-SHA256 signature.
+  AlertEmail:
+    Type: String
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    Description: Receives alarm notifications. Confirm the SNS subscription email after deploy.
+  ProcessDelaySeconds:
+    Type: Number
+    Default: 30
+    MinValue: 0
+    MaxValue: 900
+    Description: Delay before a new transaction is processed (SQS DelaySeconds, max 900).
+  MaxReceiveCount:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    Description: Delivery attempts before a message moves to the DLQ. Also tells the worker which attempt is the last.
+  WorkerMaxConcurrency:
+    Type: Number
+    Default: 5
+    MinValue: 2
+    Description: Cap on concurrent worker invocations (protects the database connection limit).
+  ApiReservedConcurrency:
+    Type: Number
+    Default: -1
+    Description: >
+      Reserved concurrency for the API function (blast-radius limit). -1 = none. Brand-new AWS
+      accounts often cannot reserve any (a minimum of 10 must stay unreserved).
+  DbSsl:
+    Type: String
+    Default: require
+    AllowedValues: [require, disable]
+  LogLevel:
+    Type: String
+    Default: info
+    AllowedValues: [error, warn, info, debug]
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90]
+
+Conditions:
+  HasWebhookSecret: !Not [!Equals [!Ref WebhookSecret, '']]
+  HasApiReservedConcurrency: !Not [!Equals [!Ref ApiReservedConcurrency, '-1']]
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures: [arm64]
+    MemorySize: 512
+    Environment:
+      Variables:
+        NODE_ENV: production
+        NODE_OPTIONS: --enable-source-maps
+        LOG_LEVEL: !Ref LogLevel
+        DATABASE_URL: !Ref DatabaseUrl
+        DB_SSL: !Ref DbSsl
+        DB_POOL_MAX: '1' # one connection per container; Lambda concurrency bounds the total
+        QUEUE_DRIVER: sqs
+        QUEUE_URL: !Ref TransactionQueue
+        PROCESS_DELAY_SECONDS: !Ref ProcessDelaySeconds
+        MAX_RECEIVE_COUNT: !Ref MaxReceiveCount
+        RECONCILE_AFTER_SECONDS: '120'
+        RECONCILE_RETRYING_AFTER_SECONDS: '1800'
+        RECONCILE_BATCH_SIZE: '100'
+
+Resources:
+  # ---------------------------------------------------------------- Queues
+  TransactionDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600 # 14 days (maximum) to investigate and redrive
+      SqsManagedSseEnabled: true
+
+  TransactionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      # Lambda guidance: at least 6x the consumer timeout. Also the pause between retries.
+      VisibilityTimeout: 120
+      MessageRetentionPeriod: 345600 # 4 days
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt TransactionDeadLetterQueue.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+
+  # ------------------------------------------------------------- Functions
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Format: esm
+        Target: es2022
+        Minify: true
+        Sourcemap: true
+        OutExtension: ['.js=.mjs'] # package.json is not shipped, so ESM needs the .mjs extension
+        # Bundled CommonJS dependencies (pg, pino) still call require().
+        Banner:
+          - "js=import { createRequire } from 'module'; const require = createRequire(import.meta.url);"
+        External: [pg-native]
+        EntryPoints: [src/handlers/api.js]
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-api'
+      Description: Webhook, health and query endpoints (Express).
+      CodeUri: .
+      Handler: api.handler
+      Timeout: 10
+      ReservedConcurrentExecutions: !If [HasApiReservedConcurrency, !Ref ApiReservedConcurrency, !Ref AWS::NoValue]
+      LoggingConfig:
+        LogGroup: !Ref ApiLogGroup
+      Environment:
+        Variables:
+          WEBHOOK_SECRET: !If [HasWebhookSecret, !Ref WebhookSecret, !Ref AWS::NoValue]
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt TransactionQueue.QueueName
+      FunctionUrlConfig:
+        AuthType: NONE # public: payment processors cannot sign AWS requests; HMAC protects the webhook
+        InvokeMode: BUFFERED
+      Events:
+        WarmUp:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Description: Keeps a container and its database connection warm for the 500 ms budget.
+            Input: '{"warmup": true}'
+
+  # Since Oct 2025 a public Function URL needs BOTH statements. SAM adds the first; stating both
+  # explicitly guarantees the URL never answers 403.
+  ApiUrlInvokeUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+  ApiUrlInvokeFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Format: esm
+        Target: es2022
+        Minify: true
+        Sourcemap: true
+        OutExtension: ['.js=.mjs']
+        Banner:
+          - "js=import { createRequire } from 'module'; const require = createRequire(import.meta.url);"
+        External: [pg-native]
+        EntryPoints: [src/handlers/worker.js]
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-worker'
+      Description: Processes transactions after the SQS delay.
+      CodeUri: .
+      Handler: worker.handler
+      Timeout: 20 # x6 = 120 s queue visibility timeout
+      LoggingConfig:
+        LogGroup: !Ref WorkerLogGroup
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt TransactionQueue.QueueName
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt TransactionQueue.Arn
+            BatchSize: 5
+            MaximumBatchingWindowInSeconds: 0
+            FunctionResponseTypes: [ReportBatchItemFailures] # fail records individually
+            ScalingConfig:
+              MaximumConcurrency: !Ref WorkerMaxConcurrency
+
+  ReconcilerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Format: esm
+        Target: es2022
+        Minify: true
+        Sourcemap: true
+        OutExtension: ['.js=.mjs']
+        Banner:
+          - "js=import { createRequire } from 'module'; const require = createRequire(import.meta.url);"
+        External: [pg-native]
+        EntryPoints: [src/handlers/reconciler.js]
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-reconciler'
+      Description: Re-queues transactions whose job was never sent or was lost.
+      CodeUri: .
+      Handler: reconciler.handler
+      Timeout: 60
+      LoggingConfig:
+        LogGroup: !Ref ReconcilerLogGroup
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt TransactionQueue.QueueName
+      Events:
+        Schedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Description: Self-healing sweep; also keeps a free Supabase project from pausing.
+
+  # ------------------------------------------------------------------ Logs
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-api'
+      RetentionInDays: !Ref LogRetentionDays
+
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-worker'
+      RetentionInDays: !Ref LogRetentionDays
+
+  ReconcilerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-reconciler'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Lambda's own Errors metric misses these: the app returns a 500 / marks FAILED instead of crashing.
+  ApiUnhandledErrorsFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ApiLogGroup
+      FilterPattern: '{ $.event = "request.failed" }'
+      MetricTransformations:
+        - MetricNamespace: TransactionWebhookService
+          MetricName: !Sub '${AWS::StackName}-ApiUnhandledErrors'
+          MetricValue: '1'
+          DefaultValue: 0
+
+  TransactionsFailedFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref WorkerLogGroup
+      FilterPattern: '{ $.event = "txn.failed" }'
+      MetricTransformations:
+        - MetricNamespace: TransactionWebhookService
+          MetricName: !Sub '${AWS::StackName}-TransactionsFailed'
+          MetricValue: '1'
+          DefaultValue: 0
+
+  # ---------------------------------------------------------------- Alarms
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  DeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A message exhausted its retries. Inspect last_error on the transaction, fix, then redrive the DLQ.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt TransactionDeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  QueueBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Oldest message is over 5 minutes old (normal is about the 30 s delay). The worker is failing, throttled or stuck.
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt TransactionQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  TransactionsFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: A transaction was marked FAILED after its final attempt.
+      Namespace: TransactionWebhookService
+      MetricName: !Sub '${AWS::StackName}-TransactionsFailed'
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  ApiUnhandledErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The API answered 500 because the database or queue was unreachable (senders will retry).
+      Namespace: TransactionWebhookService
+      MetricName: !Sub '${AWS::StackName}-ApiUnhandledErrors'
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  ApiThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The API function is being throttled (concurrency limit reached); webhooks are being rejected.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ApiFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  WorkerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The worker crashed or timed out (not just a per-record failure).
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WorkerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  ReconcilerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The reconciler failed (database unreachable or some jobs could not be re-queued).
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ReconcilerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+Outputs:
+  ApiUrl:
+    Description: Public base URL. Health check is GET /; webhook is POST /v1/webhooks/transactions.
+    Value: !GetAtt ApiFunctionUrl.FunctionUrl
+  QueueUrl:
+    Value: !Ref TransactionQueue
+  DeadLetterQueueUrl:
+    Value: !Ref TransactionDeadLetterQueue
+  AlertTopicArn:
+    Value: !Ref AlertTopic
