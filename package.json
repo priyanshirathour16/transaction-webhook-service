@@ -32,7 +32,7 @@
     "db:down": "docker compose down"
   },
   "dependencies": {
-    "@aws-sdk/client-sqs": "^3.1153.0",
+    "@aws-sdk/client-sqs": "^3.1156.0",
     "@codegenie/serverless-express": "^5.0.0",
     "ajv": "^8.20.0",
     "express": "^5.3.0",
